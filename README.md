@@ -473,18 +473,4 @@ docker compose up -d --build prediction
 - The developers are not liable for any financial losses
 - This is not financial advice
 
-## License
-
-MIT License - See LICENSE file for details
-
-## Credits
-
-Built with Claude Code by Anthropic
-
 ---
-
-**Ready to Trade?** Start with small amounts and monitor closely for the first 24-48 hours.
-
-**Questions?** Check logs first, then open an issue on GitHub.
-
-**Happy Trading! 🚀📈**
