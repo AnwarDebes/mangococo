@@ -4,6 +4,7 @@ Run with: python monitor.py
 """
 import redis
 import json
+import os
 from datetime import datetime
 
 # Colors for terminal
@@ -14,8 +15,13 @@ CYAN = "\033[96m"
 RESET = "\033[0m"
 BOLD = "\033[1m"
 
+# Redis configuration from environment
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "")
+
 def main():
-    r = redis.Redis(host='localhost', port=6379, password='REMOVED_SECRET', decode_responses=True)
+    r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASSWORD, decode_responses=True)
     pubsub = r.pubsub()
 
     # Subscribe to order updates
@@ -33,7 +39,7 @@ def main():
         try:
             data = json.loads(message['data'])
             channel = message['channel']
-            timestamp = datetime.now().strftime("%H:%M:%S")
+            display_time = datetime.now().strftime("%H:%M:%S")
 
             if channel == 'filled_orders':
                 symbol = data.get('symbol', 'N/A')
@@ -49,7 +55,7 @@ def main():
                     color = RED
                     icon = "SELL"
 
-                print(f"{color}{BOLD}[{timestamp}] {icon} {symbol}{RESET}")
+                print(f"{color}{BOLD}[{display_time}] {icon} {symbol}{RESET}")
                 print(f"{color}   Amount: {filled:.6f} @ ${price:.6f}{RESET}")
                 print(f"{color}   Total:  ${cost:.4f} USDT{RESET}")
                 print(f"{'-'*40}")
@@ -59,14 +65,13 @@ def main():
                 reason = data.get('reason', '')
                 if reason in ['stop_loss', 'take_profit', 'max_hold_time']:
                     symbol = data.get('symbol', 'N/A')
-                    action = data.get('action', 'N/A')
 
                     if reason == 'stop_loss':
-                        print(f"{RED}[{timestamp}] STOP LOSS triggered: {symbol}{RESET}")
+                        print(f"{RED}[{display_time}] STOP LOSS triggered: {symbol}{RESET}")
                     elif reason == 'take_profit':
-                        print(f"{GREEN}[{timestamp}] TAKE PROFIT triggered: {symbol}{RESET}")
+                        print(f"{GREEN}[{display_time}] TAKE PROFIT triggered: {symbol}{RESET}")
                     elif reason == 'max_hold_time':
-                        print(f"{YELLOW}[{timestamp}] MAX HOLD TIME: {symbol}{RESET}")
+                        print(f"{YELLOW}[{display_time}] MAX HOLD TIME: {symbol}{RESET}")
 
         except json.JSONDecodeError:
             pass

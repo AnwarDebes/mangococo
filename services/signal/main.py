@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 
 import redis.asyncio as aioredis
 import structlog
+import httpx
 from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
@@ -178,6 +179,30 @@ async def listen_for_position_updates():
                 current_positions.pop(symbol, None)
 
 
+async def sync_balance_from_mexc():
+    """Fetch real balance from executor service and update Redis portfolio_state"""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get("http://executor:8005/balance")
+            if response.status_code == 200:
+                data = response.json()
+                balances = data.get("balances", {})
+                usdt_balance = balances.get("USDT", {}).get("free", 0)
+
+                portfolio_state = {
+                    "total_capital": usdt_balance,
+                    "available_capital": usdt_balance,
+                    "daily_pnl": 0,
+                    "open_positions": 0
+                }
+                await redis_client.set("portfolio_state", json.dumps(portfolio_state))
+                logger.info(f"Synced USDT balance from MEXC: ${usdt_balance:.2f}")
+                return usdt_balance
+    except Exception as e:
+        logger.warning(f"Could not sync balance from MEXC: {e}")
+    return None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global redis_client
@@ -185,6 +210,9 @@ async def lifespan(app: FastAPI):
 
     redis_client = aioredis.Redis(host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASSWORD, decode_responses=True)
     await redis_client.ping()
+
+    # Sync real balance from MEXC on startup
+    await sync_balance_from_mexc()
 
     positions = await redis_client.hgetall("positions")
     for symbol, data in positions.items():
