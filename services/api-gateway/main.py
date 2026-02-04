@@ -22,7 +22,7 @@ REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "")
 
 SERVICES = {
-    "market_data": "http://host.docker.internal:8001",  # Host network mode - use host.docker.internal to reach host
+    "market_data": "http://market-data:8001",
     "prediction": "http://prediction:8000",
     "signal": "http://signal:8000",
     "risk": "http://risk:8000",

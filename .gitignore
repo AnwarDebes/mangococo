@@ -8,6 +8,8 @@
 # Never commit these files!
 .env
 config/.env
+config/.env.example
+*.env.example
 *.env.local
 *.env.production
 *secret*
@@ -279,3 +281,14 @@ valid_trading_pairs.txt
 # Performance data
 performance_reports/
 backtest_results/
+
+# ============================================
+# User-specific data (do not commit)
+# ============================================
+# Postman/API collections with local settings
+mangococo_collection.json
+info.json
+
+# Trading pairs list (auto-generated from MEXC API)
+config/trading_pairs.txt
+trading_pairs.txt

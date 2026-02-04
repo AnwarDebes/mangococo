@@ -25,6 +25,7 @@ CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", 0.3))  # 30% conf
 STARTING_CAPITAL = float(os.getenv("STARTING_CAPITAL", 11.0))
 MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", 0.50))
 MIN_POSITION_USD = float(os.getenv("MIN_POSITION_USD", 1.0))
+TRADING_PAIRS_FILE = os.getenv("TRADING_PAIRS_FILE", "")
 TRADING_PAIRS = os.getenv("TRADING_PAIRS", "BTC/USDT,ETH/USDT,SOL/USDT").split(",")
 
 logger = structlog.get_logger()
@@ -90,20 +91,38 @@ async def generate_signal(prediction: dict) -> Optional[Signal]:
         return None
 
     if action == "buy":
-        # Get available balance from Redis (executor syncs this with actual balance)
-        portfolio = await redis_client.get("portfolio_state")
-        available = json.loads(portfolio).get("available_capital", STARTING_CAPITAL) if portfolio else STARTING_CAPITAL
+        # Get actual balance from executor service (more reliable than Redis cache)
+        available = None
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.get("http://executor:8005/balance")
+                if response.status_code == 200:
+                    data = response.json()
+                    balances = data.get("balances", {})
+                    usdt_balance = balances.get("USDT", {}).get("free", 0) or 0
+                    available = usdt_balance
+                    logger.info(f"Fetched actual USDT balance from executor: ${available:.2f}")
+        except Exception as e:
+            logger.warning(f"Could not fetch balance from executor, using Redis fallback: {e}")
+        
+        # Fallback to Redis if executor call failed
+        if available is None:
+            portfolio = await redis_client.get("portfolio_state")
+            available = json.loads(portfolio).get("available_capital", STARTING_CAPITAL) if portfolio else STARTING_CAPITAL
+            logger.info(f"Using Redis balance: ${available:.2f}")
 
-        # STRICT $1.50 TRADE LIMIT - Never exceed this amount
-        if available < 1.5:
-            logger.info("Insufficient USDT balance for $1.50 trade, skipping buy signal", balance=available)
+        # MINIMUM $1.50 TRADE LIMIT - Increased buffer above MEXC $1 USDT minimum
+        MIN_TRADE_VALUE = 1.5
+        if available < MIN_TRADE_VALUE:
+            logger.info(f"Insufficient USDT balance for ${MIN_TRADE_VALUE} trade, skipping buy signal", balance=available)
+            SIGNALS_SKIPPED.labels(reason="insufficient_balance").inc()
             return None
 
-        # STRICT ENFORCEMENT: Always exactly $1.50, never more
-        trade_value = 1.5  # EXACTLY $1.50 per trade - no variations allowed
+        # Use minimum trade value (can be increased for better execution, but never below $1.50)
+        trade_value = MIN_TRADE_VALUE  # Minimum $1.50 per trade
 
         # For MEXC market buy orders, send the USDT cost amount directly
-        amount = trade_value  # Send EXACTLY $1.50, not coin quantity
+        amount = trade_value  # Send minimum $1.50, not coin quantity
         logger.info("Calculating trade", symbol=symbol, available=available, trade_value=trade_value, amount=amount, price=current_price)
     else:
         amount = current_positions[symbol].amount
@@ -203,13 +222,40 @@ async def sync_balance_from_mexc():
     return None
 
 
+def load_symbols_from_file(filepath: str, wait_seconds: int = 60) -> list:
+    """Load symbols from file (one per line). Wait for file to exist and be non-empty up to wait_seconds."""
+    import time
+    start = time.monotonic()
+    while (time.monotonic() - start) < wait_seconds:
+        try:
+            if os.path.isfile(filepath):
+                with open(filepath, "r") as f:
+                    lines = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
+                if lines:
+                    return lines
+        except Exception:
+            pass
+        time.sleep(2)
+    return []
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global redis_client
+    global redis_client, TRADING_PAIRS
     logger.info("Starting Signal Service...")
 
     redis_client = aioredis.Redis(host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASSWORD, decode_responses=True)
     await redis_client.ping()
+
+    if TRADING_PAIRS_FILE:
+        pairs = await asyncio.to_thread(load_symbols_from_file, TRADING_PAIRS_FILE)
+        if pairs:
+            TRADING_PAIRS = pairs
+            logger.info(f"Loaded {len(TRADING_PAIRS)} symbols from {TRADING_PAIRS_FILE}")
+        else:
+            logger.warning("TRADING_PAIRS_FILE set but file empty or missing, using TRADING_PAIRS env")
+    else:
+        TRADING_PAIRS = [s.strip() for s in os.getenv("TRADING_PAIRS", "BTC/USDT,ETH/USDT,SOL/USDT").split(",") if s.strip()]
 
     # Sync real balance from MEXC on startup
     await sync_balance_from_mexc()

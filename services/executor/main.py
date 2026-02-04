@@ -67,7 +67,7 @@ async def sync_portfolio_balance():
         # Only sync if we have valid API keys
         if hasattr(exchange, 'apiKey') and exchange.apiKey and exchange.apiKey != "your_mexc_api_key_here":
             balance = await exchange.fetch_balance()
-            usdt_balance = balance.get("USDT", {}).get("free", 0)
+            usdt_balance = balance.get("USDT", {}).get("free", 0) or 0
 
             # Get current portfolio state
             portfolio_state_str = await redis_client.get("portfolio_state")
@@ -76,13 +76,35 @@ async def sync_portfolio_balance():
             else:
                 portfolio_state = {}
 
-            # Update available capital with actual balance
+            # Update available capital with actual USDT free balance (for trading)
+            # This is the amount available for new trades, not total portfolio value
             portfolio_state["available_capital"] = usdt_balance
+            portfolio_state["usdt_free"] = usdt_balance  # Store USDT free separately
             portfolio_state["last_trade_time"] = datetime.utcnow().isoformat()
+            
+            # Calculate total portfolio value (USDT + holdings)
+            total_value = usdt_balance
+            for coin, coin_data in balance.items():
+                if coin != "USDT" and isinstance(coin_data, dict):
+                    free = coin_data.get("free", 0) or 0
+                    if free > 0.0001:  # Only count significant holdings
+                        try:
+                            # Try to get current price from Redis
+                            tick_key = f"ticker:{coin}/USDT"
+                            tick_data = await redis_client.get(tick_key)
+                            if tick_data:
+                                tick = json.loads(tick_data)
+                                price = tick.get("price") or tick.get("last") or 0
+                                if price > 0:
+                                    total_value += free * price
+                        except:
+                            pass  # Skip if price not available
+            
+            portfolio_state["total_capital"] = total_value
 
             # Save updated portfolio state
             await redis_client.set("portfolio_state", json.dumps(portfolio_state))
-            logger.debug("Portfolio balance synced", available_capital=usdt_balance)
+            logger.debug("Portfolio balance synced", available_capital=usdt_balance, total_capital=total_value)
         else:
             logger.debug("Skipping portfolio sync - no valid API keys")
     except Exception as e:
@@ -124,28 +146,114 @@ async def execute_order(request: OrderRequest) -> OrderResponse:
         if request.order_type != "market":
             request.price = current_price
         
-        # Ensure order value is at least 1.05 USDT (MEXC minimum with larger buffer for rounding/precision)
-        min_order_value = 1.05
+        # Ensure order value is at least 1.40 USDT (increased buffer above MEXC $1 USDT minimum)
+        min_order_value = 1.40
 
         # For BUY orders: amount from signal is USDT value, convert to coin quantity
         # For SELL orders: amount is already coin quantity
         if request.side == "buy":
-            # Signal sends USDT value (e.g., 1.5 means $1.50), convert to coin quantity
+            # Signal sends USDT value (e.g., 1.4 means $1.40), convert to coin quantity
             usdt_amount = request.amount
+            
+            # VALIDATE ACTUAL USDT BALANCE BEFORE BUYING - never place without valid balance
+            try:
+                balance = await exchange.fetch_balance()
+                usdt_balance_data = balance.get("USDT", {})
+                usdt_balance = float(usdt_balance_data.get("free", 0) or 0)
+                
+                logger.info("BUY order balance check", symbol=request.symbol,
+                            requested_usdt=usdt_amount, available_usdt=usdt_balance)
+                
+                if usdt_balance <= 0:
+                    raise ValueError(f"Insufficient USDT balance: have ${usdt_balance:.2f}, cannot buy ${usdt_amount:.2f}")
+                
+                if usdt_balance < min_order_value:
+                    raise ValueError(
+                        f"USDT balance ${usdt_balance:.2f} is below minimum order value ${min_order_value:.2f}; "
+                        "cannot place buy order."
+                    )
+                
+                # If we don't have enough USDT for requested amount, use what we have (with small buffer)
+                if usdt_balance < usdt_amount:
+                    original_requested = usdt_amount
+                    usdt_amount = usdt_balance * 0.99
+                    logger.warning(
+                        "Reducing buy to available balance",
+                        symbol=request.symbol,
+                        requested=original_requested,
+                        available=usdt_balance,
+                        adjusted=usdt_amount,
+                    )
+                
+                if usdt_amount < min_order_value:
+                    raise ValueError(
+                        f"Adjusted USDT amount ${usdt_amount:.2f} below minimum ${min_order_value:.2f}; "
+                        "insufficient balance for a valid order."
+                    )
+            except ValueError:
+                # Validation failure: do not place order
+                raise
+            except Exception as balance_error:
+                logger.error("Failed to fetch balance for buy order", symbol=request.symbol, error=str(balance_error))
+                raise ValueError(
+                    f"Cannot place buy order: balance check failed ({balance_error}). "
+                    "Order aborted for safety."
+                ) from balance_error
+            
             coin_quantity = usdt_amount / current_price
             request.amount = coin_quantity
             order_value = usdt_amount  # Original USDT value
             logger.info(f"BUY order: Converting ${usdt_amount:.4f} USDT to {coin_quantity:.8f} coins @ ${current_price}")
         else:
-            # SELL orders: amount is coin quantity
+            # SELL orders: amount is coin quantity - VALIDATE ACTUAL BALANCE
+            coin_symbol = request.symbol.split("/")[0]  # e.g., "BTC" from "BTC/USDT"
+            
+            try:
+                balance = await exchange.fetch_balance()
+                coin_balance_data = balance.get(coin_symbol, {})
+                coin_balance = float(coin_balance_data.get("free", 0) or 0)
+                
+                logger.info("SELL order balance check", symbol=request.symbol, coin=coin_symbol,
+                            requested_amount=request.amount, available_balance=coin_balance)
+                
+                if coin_balance <= 0:
+                    raise ValueError(f"Insufficient {coin_symbol} balance: have {coin_balance}, cannot sell {request.amount}")
+                
+                original_requested = request.amount
+                if coin_balance < request.amount:
+                    request.amount = coin_balance * 0.999
+                    logger.warning(
+                        "Reducing sell to available balance",
+                        symbol=request.symbol,
+                        requested=original_requested,
+                        available=coin_balance,
+                        adjusted=request.amount,
+                    )
+                elif request.amount > coin_balance * 0.999:
+                    request.amount = coin_balance * 0.999
+                    logger.warning("Adjusted sell amount to available balance",
+                                   original=original_requested, adjusted=request.amount, available=coin_balance)
+            except ValueError:
+                raise
+            except Exception as balance_error:
+                logger.error("Failed to fetch balance for sell order", symbol=request.symbol, error=str(balance_error))
+                raise ValueError(
+                    f"Cannot place sell order: balance check failed ({balance_error}). Order aborted for safety."
+                ) from balance_error
+            
             order_value = request.amount * current_price
 
         if order_value < min_order_value:
-            # Recalculate amount based on current market price to ensure minimum
+            if request.side == "buy":
+                raise ValueError(
+                    f"Order value ${order_value:.2f} is below minimum ${min_order_value:.2f} and "
+                    "insufficient USDT balance to meet minimum. Order aborted."
+                )
+            # For sell: recalculate to meet exchange minimum if needed
             original_coin_amount = request.amount
             request.amount = min_order_value / current_price
             order_value = min_order_value
-            logger.warning("Adjusted order to meet minimum", original_coin_amount=original_coin_amount, new_coin_amount=request.amount, order_value=order_value, price=current_price)
+            logger.warning("Adjusted sell order to meet minimum", original_coin_amount=original_coin_amount, new_coin_amount=request.amount, order_value=order_value, price=current_price)
         
         logger.info("Order details", amount=request.amount, price=request.price, order_value=order_value)
 
@@ -265,9 +373,27 @@ async def execute_order(request: OrderRequest) -> OrderResponse:
         return response
 
     except Exception as e:
-        ORDERS_FAILED.labels(reason=type(e).__name__).inc()
-        logger.error("Order failed", order_id=order_id, error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+        error_str = str(e).lower()
+        error_msg = str(e)
+        
+        # Handle specific MEXC errors with better messages
+        if "insufficient position" in error_str or "30004" in error_msg:
+            # This should not happen now with balance validation, but handle gracefully
+            reason = "insufficient_position"
+            detail_msg = f"Insufficient {request.symbol.split('/')[0]} balance. Balance validation should have prevented this. Error: {error_msg}"
+            logger.error("Order failed - Insufficient position (should have been caught by validation)", 
+                        order_id=order_id, symbol=request.symbol, side=request.side, amount=request.amount, error=error_msg)
+        elif "minimum transaction volume" in error_str or "30002" in error_msg:
+            reason = "below_minimum_volume"
+            detail_msg = f"Order value below MEXC minimum ($1 USDT). Error: {error_msg}"
+            logger.error("Order failed - Below minimum volume", order_id=order_id, symbol=request.symbol, error=error_msg)
+        else:
+            reason = type(e).__name__
+            detail_msg = error_msg
+        
+        ORDERS_FAILED.labels(reason=reason).inc()
+        logger.error("Order failed", order_id=order_id, symbol=request.symbol, side=request.side, error=error_msg)
+        raise HTTPException(status_code=500, detail=detail_msg)
 
 
 async def listen_for_validated_signals():

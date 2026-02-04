@@ -43,6 +43,10 @@ class Position(BaseModel):
     stop_loss_price: Optional[float] = None
     take_profit_price: Optional[float] = None
     max_hold_time_minutes: Optional[float] = None
+    # Trailing stop-loss fields
+    trailing_stop_activated: bool = False
+    highest_price: Optional[float] = None  # Track highest price for trailing stop
+    trailing_stop_distance_pct: float = 0.003  # 0.3% trailing distance
 
 
 # Global State
@@ -122,6 +126,19 @@ async def handle_filled_order(order: dict):
             max_loss = MAX_TRADE_LOSS_PCT
             max_hold = MAX_HOLD_TIME_MINUTES
         
+        # Check for dynamic profit target from prediction service (ATR-based)
+        dynamic_target_key = f"profit_target:{symbol}"
+        dynamic_target_str = await redis_client.get(dynamic_target_key)
+        if dynamic_target_str:
+            try:
+                dynamic_target = float(dynamic_target_str) / 100.0  # Convert from percentage to decimal
+                # Use dynamic target if it's reasonable (between 0.05% and 5%)
+                if 0.0005 <= dynamic_target <= 0.05:
+                    profit_target = dynamic_target
+                    logger.info(f"Using dynamic profit target for {symbol}: {profit_target:.4%} (ATR-based)")
+            except (ValueError, TypeError):
+                pass  # Fall back to default if parsing fails
+        
         # Calculate stop-loss and take-profit prices
         if side == "long":
             stop_loss_price = order_price * (1 - max_loss)
@@ -134,7 +151,10 @@ async def handle_filled_order(order: dict):
             symbol=symbol, side=side, entry_price=order_price,
             current_price=order_price, amount=filled_amount, opened_at=datetime.utcnow().isoformat(),
             stop_loss_price=stop_loss_price, take_profit_price=take_profit_price,
-            max_hold_time_minutes=max_hold
+            max_hold_time_minutes=max_hold,
+            trailing_stop_activated=False,
+            highest_price=order_price,  # Initialize tracking for trailing stop
+            trailing_stop_distance_pct=0.003  # 0.3% trailing distance
         )
         await redis_client.publish("position_opened", json.dumps({"symbol": symbol, "side": side, "amount": filled_amount, "price": order_price}))
         logger.info("Position opened", symbol=symbol, side=side, amount=filled_amount, price=order_price, 
@@ -310,18 +330,57 @@ async def update_prices():
                         "timestamp": datetime.utcnow().isoformat()
                     }))
                 
+                # TRAILING STOP-LOSS LOGIC (Profitable Strategy Enhancement)
+                # Activate trailing stop after 0.5% profit (research-backed threshold)
+                profit_pct = ((pos.current_price - pos.entry_price) / pos.entry_price) if pos.side == "long" else ((pos.entry_price - pos.current_price) / pos.entry_price)
+
+                if not pos.trailing_stop_activated and profit_pct >= 0.005:  # 0.5% profit threshold
+                    pos.trailing_stop_activated = True
+                    pos.highest_price = pos.current_price
+                    logger.info("✨ Trailing stop-loss ACTIVATED", symbol=symbol, profit_pct=f"{profit_pct:.2%}", current_price=pos.current_price)
+
+                # Update trailing stop if price moves favorably
+                if pos.trailing_stop_activated:
+                    if pos.highest_price is None:
+                        pos.highest_price = pos.current_price
+
+                    if pos.side == "long":
+                        # Update highest price for long positions
+                        if pos.current_price > pos.highest_price:
+                            pos.highest_price = pos.current_price
+                            # Trail stop-loss by 0.3% below highest price
+                            new_stop = pos.highest_price * (1 - pos.trailing_stop_distance_pct)
+                            # Only raise stop-loss, never lower it
+                            if new_stop > pos.stop_loss_price:
+                                old_stop = pos.stop_loss_price
+                                pos.stop_loss_price = new_stop
+                                logger.info("📈 Trailing stop raised", symbol=symbol, old_stop=old_stop, new_stop=pos.stop_loss_price, highest_price=pos.highest_price)
+                    else:  # short
+                        # Update lowest price for short positions
+                        if pos.current_price < pos.highest_price or pos.highest_price is None:
+                            pos.highest_price = pos.current_price  # For shorts, track lowest price
+                            # Trail stop-loss by 0.3% above lowest price
+                            new_stop = pos.highest_price * (1 + pos.trailing_stop_distance_pct)
+                            # Only lower stop-loss, never raise it
+                            if new_stop < pos.stop_loss_price:
+                                old_stop = pos.stop_loss_price
+                                pos.stop_loss_price = new_stop
+                                logger.info("📉 Trailing stop lowered", symbol=symbol, old_stop=old_stop, new_stop=pos.stop_loss_price, lowest_price=pos.highest_price)
+
                 # Check stop-loss and take-profit conditions
                 if pos.stop_loss_price and pos.take_profit_price:
                     if pos.side == "long":
                         if pos.current_price <= pos.stop_loss_price:
-                            logger.warning("Stop-loss triggered", symbol=symbol, price=pos.current_price, stop_loss=pos.stop_loss_price)
+                            trail_msg = " (TRAILING STOP)" if pos.trailing_stop_activated else ""
+                            logger.warning(f"Stop-loss triggered{trail_msg}", symbol=symbol, price=pos.current_price, stop_loss=pos.stop_loss_price)
                             positions_to_close.append((symbol, "stop_loss"))
                         elif pos.current_price >= pos.take_profit_price:
                             logger.info("Take-profit triggered", symbol=symbol, price=pos.current_price, take_profit=pos.take_profit_price)
                             positions_to_close.append((symbol, "take_profit"))
                     else:  # short
                         if pos.current_price >= pos.stop_loss_price:
-                            logger.warning("Stop-loss triggered", symbol=symbol, price=pos.current_price, stop_loss=pos.stop_loss_price)
+                            trail_msg = " (TRAILING STOP)" if pos.trailing_stop_activated else ""
+                            logger.warning(f"Stop-loss triggered{trail_msg}", symbol=symbol, price=pos.current_price, stop_loss=pos.stop_loss_price)
                             positions_to_close.append((symbol, "stop_loss"))
                         elif pos.current_price <= pos.take_profit_price:
                             logger.info("Take-profit triggered", symbol=symbol, price=pos.current_price, take_profit=pos.take_profit_price)
