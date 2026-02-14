@@ -255,7 +255,7 @@ htmlcov/
 # Your implementation documentation (can keep if you want)
 # mangococo_complete_implementation-Final.md
 
-# Claude Code IDE files (contains sensitive session data)
+# IDE session files
 .claude/
 *.claude
 

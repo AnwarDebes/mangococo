@@ -5,10 +5,8 @@ services:
     container_name: mc-redis
     restart: unless-stopped
     env_file: ./config/trading.env
-    # Configure Redis to handle persistence failures gracefully
-    # --save "" disables RDB persistence (we use Redis for real-time data, not long-term storage)
-    # This prevents I/O errors from affecting Redis operation
-    command: redis-server --requirepass ${REDIS_PASSWORD} --save "" --appendonly no
+    # AOF persistence enabled to preserve positions, portfolio state, and trade history across restarts
+    command: redis-server --requirepass ${REDIS_PASSWORD} --save "" --appendonly yes --appendfsync everysec
     ports:
       - "6379:6379"
     volumes:
@@ -38,7 +36,10 @@ services:
       timeout: 5s
       retries: 5
 
-  # Trading Services
+  # =============================================
+  # Core Trading Services
+  # =============================================
+
   market-data:
     build: ./services/market-data
     container_name: mc-market-data
@@ -50,90 +51,12 @@ services:
       - ./config:/config
     environment:
       - REDIS_HOST=redis
+      - POSTGRES_HOST=timescaledb
+      - DB_ENABLED=true
+      - WS_ENABLED=true
+      - WS_TOP_SYMBOLS=100
     depends_on:
       redis:
         condition: service_healthy
-
-  prediction:
-    build: ./services/prediction
-    container_name: mc-prediction
-    restart: unless-stopped
-    env_file: ./config/trading.env
-    ports:
-      - "8002:8000"
-    volumes:
-      - ./shared/models:/app/models
-      - ./config:/config
-    depends_on:
-      redis:
+      timescaledb:
         condition: service_healthy
-    # Uncomment below to enable GPU support (requires NVIDIA Docker runtime)
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: 1
-    #           capabilities: [gpu]
-
-  signal:
-    build: ./services/signal
-    container_name: mc-signal
-    restart: unless-stopped
-    env_file: ./config/trading.env
-    ports:
-      - "8003:8000"
-    volumes:
-      - ./config:/config
-    depends_on:
-      redis:
-        condition: service_healthy
-
-  risk:
-    build: ./services/risk
-    container_name: mc-risk
-    restart: unless-stopped
-    env_file: ./config/trading.env
-    ports:
-      - "8004:8000"
-    depends_on:
-      redis:
-        condition: service_healthy
-
-  executor:
-    build: ./services/executor
-    container_name: mc-executor
-    restart: unless-stopped
-    env_file: ./config/trading.env
-    ports:
-      - "8005:8005"
-    depends_on:
-      redis:
-        condition: service_healthy
-
-  position:
-    build: ./services/position
-    container_name: mc-position
-    restart: unless-stopped
-    env_file: ./config/trading.env
-    ports:
-      - "8006:8000"
-    depends_on:
-      redis:
-        condition: service_healthy
-
-  api-gateway:
-    build: ./services/api-gateway
-    container_name: mc-api-gateway
-    restart: unless-stopped
-    env_file: ./config/trading.env
-    ports:
-      - "8080:8000"
-    depends_on:
-      - market-data
-      - prediction
-      - signal
-      - risk
-      - executor
-      - position
-      - timescaledb

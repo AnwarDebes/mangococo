@@ -27,7 +27,7 @@ MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", 2))
 MIN_TIME_BETWEEN_TRADES = int(os.getenv("MIN_TIME_BETWEEN_TRADES", 60))
 PROFIT_TARGET_PCT = float(os.getenv("PROFIT_TARGET_PCT", 0.001))  # 0.1% profit target
 MAX_TRADE_LOSS_PCT = float(os.getenv("MAX_TRADE_LOSS_PCT", 0.005))  # 0.5% stop loss
-MAX_HOLD_TIME_MINUTES = float(os.getenv("MAX_HOLD_TIME_MINUTES", 0.25))  # 15 seconds max hold
+MAX_HOLD_TIME_MINUTES = float(os.getenv("MAX_HOLD_TIME_MINUTES", 30))  # 30 minutes max hold
 
 logger = structlog.get_logger()
 
