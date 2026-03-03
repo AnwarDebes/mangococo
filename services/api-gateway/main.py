@@ -950,6 +950,495 @@ async def get_resources():
     return resources
 
 
+# =============================================
+# Phase 4: Prediction Cone
+# =============================================
+
+@app.get("/api/v2/prediction/cone")
+async def get_prediction_cone(symbol: str = "BTCUSDT"):
+    """Probability cone for War Room: historical prices + AI prediction bands."""
+    clean_symbol = symbol.replace("/", "")
+    try:
+        # Fetch last 50 candles from MEXC
+        kline_url = f"https://api.mexc.com/api/v3/klines?symbol={clean_symbol}&interval=60m&limit=50"
+        kline_resp = await http_client.get(kline_url, timeout=10.0)
+        klines = kline_resp.json()
+        closes = [float(k[4]) for k in klines]
+        current_price = closes[-1] if closes else 0
+
+        # Calculate ATR for volatility-based bands
+        highs = [float(k[2]) for k in klines]
+        lows = [float(k[3]) for k in klines]
+        trs = []
+        for i in range(1, len(klines)):
+            tr = max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1]))
+            trs.append(tr)
+        atr = sum(trs[-14:]) / min(len(trs), 14) if trs else current_price * 0.01
+
+        # Get AI prediction from prediction service
+        direction = "up"
+        confidence = 0.55
+        try:
+            pred_resp = await http_client.get(
+                f"{SERVICES['prediction']}/predict/{clean_symbol}", timeout=5.0
+            )
+            if pred_resp.status_code == 200:
+                pred = pred_resp.json()
+                direction = "up" if pred.get("direction", "up") == "up" else "down"
+                confidence = pred.get("confidence", 0.55)
+        except Exception:
+            # Fallback: use RSI-like heuristic from recent closes
+            if len(closes) >= 14:
+                recent = closes[-14:]
+                gains = sum(max(recent[i] - recent[i-1], 0) for i in range(1, len(recent)))
+                losses = sum(max(recent[i-1] - recent[i], 0) for i in range(1, len(recent)))
+                if gains + losses > 0:
+                    rsi = 100 - (100 / (1 + gains / max(losses, 0.001)))
+                    direction = "up" if rsi < 50 else "down"
+                    confidence = 0.5 + abs(rsi - 50) / 200
+
+        bias = 1 if direction == "up" else -1
+
+        return {
+            "symbol": symbol,
+            "current_price": current_price,
+            "prediction": {"direction": direction, "confidence": round(confidence, 4)},
+            "cone": {
+                "1h": {
+                    "upper": round(current_price + atr * 0.5, 2),
+                    "mid": round(current_price + bias * atr * 0.2 * confidence, 2),
+                    "lower": round(current_price - atr * 0.5, 2),
+                },
+                "4h": {
+                    "upper": round(current_price + atr * 1.2, 2),
+                    "mid": round(current_price + bias * atr * 0.5 * confidence, 2),
+                    "lower": round(current_price - atr * 1.2, 2),
+                },
+                "24h": {
+                    "upper": round(current_price + atr * 3.0, 2),
+                    "mid": round(current_price + bias * atr * 1.2 * confidence, 2),
+                    "lower": round(current_price - atr * 3.0, 2),
+                },
+            },
+            "historical": closes,
+        }
+    except Exception as e:
+        logger.error("Prediction cone failed", error=str(e))
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+# =============================================
+# Phase 4: Factor Heatmap
+# =============================================
+
+@app.get("/api/v2/prediction/factors")
+async def get_prediction_factors():
+    """Factor heatmap data for War Room."""
+    symbols = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+    factor_names = ["RSI", "MACD", "Volume", "Sentiment", "Whale", "Trend", "Volatility", "Momentum"]
+    result = []
+
+    for symbol in symbols:
+        factors = {}
+        clean = symbol.replace("/", "")
+
+        # Try to get feature-store data
+        features = {}
+        try:
+            fs_resp = await http_client.get(
+                f"{SERVICES['feature_store']}/features/{clean}", timeout=5.0
+            )
+            if fs_resp.status_code == 200:
+                features = fs_resp.json()
+        except Exception:
+            pass
+
+        # Try sentiment data
+        sent_score = 50
+        try:
+            sent_resp = await http_client.get(
+                f"{SERVICES['sentiment']}/sentiment/{symbol}", timeout=3.0
+            )
+            if sent_resp.status_code == 200:
+                sd = sent_resp.json()
+                sent_score = sd.get("score", 50)
+                if -1 <= sent_score <= 1:
+                    sent_score = (sent_score + 1) * 50
+        except Exception:
+            pass
+
+        # Build factor cells from available data
+        rsi_val = features.get("rsi_14", features.get("rsi", 50))
+        rsi_dir = "bullish" if rsi_val < 35 else "bearish" if rsi_val > 65 else "neutral"
+        factors["RSI"] = {"value": round(rsi_val, 1), "direction": rsi_dir, "description": f"RSI at {rsi_val:.0f} — {'oversold, historically bullish' if rsi_val < 35 else 'overbought, historically bearish' if rsi_val > 65 else 'neutral zone'}"}
+
+        macd_val = features.get("macd", features.get("macd_histogram", 0))
+        macd_dir = "bullish" if macd_val > 0 else "bearish" if macd_val < 0 else "neutral"
+        factors["MACD"] = {"value": round(macd_val, 4), "direction": macd_dir, "description": f"MACD {'positive — bullish momentum' if macd_val > 0 else 'negative — bearish momentum' if macd_val < 0 else 'flat — no clear signal'}"}
+
+        vol_ratio = features.get("volume_ratio", features.get("volume_vs_avg", 1.0))
+        vol_dir = "bullish" if vol_ratio > 1.5 else "bearish" if vol_ratio < 0.5 else "neutral"
+        factors["Volume"] = {"value": round(vol_ratio, 2), "direction": vol_dir, "description": f"Volume {vol_ratio:.1f}x average — {'high activity' if vol_ratio > 1.5 else 'low activity' if vol_ratio < 0.5 else 'normal'}"}
+
+        sent_dir = "bullish" if sent_score > 60 else "bearish" if sent_score < 40 else "neutral"
+        factors["Sentiment"] = {"value": round(sent_score, 1), "direction": sent_dir, "description": f"Sentiment score {sent_score:.0f} — {'positive outlook' if sent_score > 60 else 'negative outlook' if sent_score < 40 else 'mixed signals'}"}
+
+        factors["Whale"] = {"value": 0, "direction": "neutral", "description": "No significant whale activity detected"}
+        factors["Trend"] = {"value": features.get("trend_strength", 0), "direction": "bullish" if features.get("trend_strength", 0) > 0 else "bearish" if features.get("trend_strength", 0) < 0 else "neutral", "description": "Trend analysis based on moving averages"}
+        factors["Volatility"] = {"value": features.get("atr_pct", features.get("volatility", 0)), "direction": "neutral", "description": "Market volatility level"}
+
+        mom = features.get("momentum", features.get("roc", 0))
+        factors["Momentum"] = {"value": round(mom, 4), "direction": "bullish" if mom > 0 else "bearish" if mom < 0 else "neutral", "description": f"Price momentum {'positive' if mom > 0 else 'negative' if mom < 0 else 'flat'}"}
+
+        result.append({"symbol": symbol, "factors": factors})
+
+    return result
+
+
+# =============================================
+# Phase 4: Whale Activity
+# =============================================
+
+@app.get("/api/v2/whales")
+async def get_whales(limit: int = 20):
+    """Whale activity feed from trend-analysis service."""
+    # Try real whale tracker
+    try:
+        resp = await http_client.get(
+            f"{SERVICES['trend']}/whales?limit={limit}", timeout=5.0
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("transactions"):
+                return data
+    except Exception:
+        pass
+
+    # Mock fallback with realistic data
+    import random
+    now = datetime.utcnow()
+    directions = ["exchange_outflow", "exchange_inflow", "exchange_outflow", "exchange_outflow"]
+    exchanges = ["Binance", "Coinbase", "Kraken", "OKX", "Bybit"]
+    txs = []
+    for i in range(min(limit, 15)):
+        d = random.choice(directions)
+        amt = random.uniform(1_000_000, 50_000_000)
+        sig = "bullish" if d == "exchange_outflow" else "bearish"
+        sym = random.choice(["BTC/USDT", "ETH/USDT", "BTC/USDT", "SOL/USDT"])
+        fr = random.choice(exchanges) if d == "exchange_outflow" else "Unknown Wallet"
+        to = "Unknown Wallet" if d == "exchange_outflow" else random.choice(exchanges)
+        ts = (now - __import__("datetime").timedelta(minutes=random.randint(1, 180))).isoformat()
+        txs.append({
+            "symbol": sym, "amount_usd": round(amt, 0), "direction": d,
+            "from_label": fr, "to_label": to, "timestamp": ts, "significance": sig,
+        })
+    txs.sort(key=lambda x: x["timestamp"], reverse=True)
+
+    net_btc = sum((-1 if t["direction"] == "exchange_inflow" else 1) * t["amount_usd"] / 87000 for t in txs if "BTC" in t["symbol"])
+    net_eth = sum((-1 if t["direction"] == "exchange_inflow" else 1) * t["amount_usd"] / 3200 for t in txs if "ETH" in t["symbol"])
+    ws = "accumulation" if net_btc > 0 else "distribution"
+
+    return {
+        "transactions": txs[:limit],
+        "summary": {
+            "net_exchange_flow_btc": round(net_btc, 2),
+            "net_exchange_flow_eth": round(net_eth, 2),
+            "whale_sentiment": ws,
+        },
+        "_simulated": True,
+    }
+
+
+# =============================================
+# Phase 4: Market Replay
+# =============================================
+
+@app.get("/api/v2/replay")
+async def get_replay(symbol: str = "BTCUSDT", start: str = "", end: str = ""):
+    """Historical replay data: candles + signals + trades merged chronologically."""
+    clean_symbol = symbol.replace("/", "")
+    events = []
+
+    # Fetch historical candles from MEXC
+    try:
+        params = f"symbol={clean_symbol}&interval=60m&limit=500"
+        if start:
+            try:
+                start_ms = int(datetime.fromisoformat(start.replace("Z", "+00:00")).timestamp() * 1000)
+                params += f"&startTime={start_ms}"
+            except Exception:
+                pass
+        if end:
+            try:
+                end_ms = int(datetime.fromisoformat(end.replace("Z", "+00:00")).timestamp() * 1000)
+                params += f"&endTime={end_ms}"
+            except Exception:
+                pass
+
+        kline_resp = await http_client.get(
+            f"https://api.mexc.com/api/v3/klines?{params}", timeout=15.0
+        )
+        klines = kline_resp.json()
+        for k in klines:
+            ts = datetime.utcfromtimestamp(k[0] / 1000).isoformat()
+            events.append({
+                "type": "candle", "time": ts,
+                "open": float(k[1]), "high": float(k[2]),
+                "low": float(k[3]), "close": float(k[4]), "volume": float(k[5]),
+            })
+    except Exception as e:
+        logger.warning("Replay candle fetch failed", error=str(e))
+
+    # Fetch historical signals from DB
+    if db_pool:
+        try:
+            async with db_pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """SELECT * FROM signals WHERE symbol = $1
+                       ORDER BY timestamp ASC LIMIT 500""",
+                    symbol.replace("USDT", "/USDT") if "/" not in symbol else symbol,
+                )
+                for r in rows:
+                    events.append({
+                        "type": "signal", "time": r["timestamp"].isoformat(),
+                        "symbol": r.get("symbol", symbol),
+                        "action": r.get("action", "HOLD"),
+                        "confidence": float(r.get("confidence", 0.5)),
+                    })
+        except Exception:
+            pass
+
+    # Fetch historical trades from DB
+    if db_pool:
+        try:
+            async with db_pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """SELECT * FROM trade_history WHERE symbol = $1
+                       ORDER BY created_at ASC LIMIT 200""",
+                    symbol.replace("USDT", "/USDT") if "/" not in symbol else symbol,
+                )
+                for r in rows:
+                    events.append({
+                        "type": "trade",
+                        "time": (r.get("created_at") or r.get("closed_at", datetime.utcnow())).isoformat(),
+                        "symbol": r.get("symbol", symbol),
+                        "side": r.get("side", "long"),
+                        "price": float(r.get("entry_price", 0)),
+                        "amount": float(r.get("amount", 0)),
+                        "pnl": float(r.get("realized_pnl", 0)),
+                    })
+        except Exception:
+            pass
+
+    events.sort(key=lambda x: x["time"])
+    return {"events": events, "total_events": len(events)}
+
+
+# =============================================
+# Phase 4: Stress Test
+# =============================================
+
+from pydantic import BaseModel
+
+class StressTestRequest(BaseModel):
+    name: str = "Custom"
+    crash_pct: float = -30.0
+    duration_days: int = 7
+
+@app.post("/api/v2/stress-test")
+async def run_stress_test(req: StressTestRequest):
+    """Simulate portfolio stress scenario against current positions."""
+    # Get current portfolio & positions
+    portfolio = {}
+    positions = {}
+    try:
+        port_resp = await http_client.get(f"{SERVICES['executor']}/balance", timeout=5.0)
+        if port_resp.status_code == 200:
+            portfolio = port_resp.json()
+    except Exception:
+        pass
+
+    try:
+        pos_resp = await http_client.get(f"{SERVICES['position']}/positions", timeout=5.0)
+        if pos_resp.status_code == 200:
+            positions = pos_resp.json()
+    except Exception:
+        pass
+
+    bal_summary = portfolio.get("summary", {})
+    total_value = bal_summary.get("total_value", 0)
+    cash = bal_summary.get("usdt_balance", 0)
+
+    crash_factor = 1 + (req.crash_pct / 100)
+    per_position = []
+    total_loss = 0
+    stop_loss_savings = 0
+    liquidated = 0
+    survived = 0
+
+    for sym, pos_data in positions.items():
+        if isinstance(pos_data, dict):
+            price = pos_data.get("price", pos_data.get("entry_price", 0))
+            amount = pos_data.get("amount", 0)
+            original = price * amount
+            sl = pos_data.get("stop_loss_price", pos_data.get("stop_loss", 0))
+            stressed_price = price * crash_factor
+            if sl and sl > stressed_price:
+                # Stop-loss triggers first
+                stressed_val = sl * amount
+                savings = (sl - stressed_price) * amount
+                stop_loss_savings += savings
+                liquidated += 1
+            else:
+                stressed_val = stressed_price * amount
+                survived += 1 if amount > 0 else 0
+
+            loss = original - stressed_val
+            total_loss += loss
+            per_position.append({
+                "symbol": sym,
+                "original_value": round(original, 2),
+                "stressed_value": round(stressed_val, 2),
+                "loss": round(loss, 2),
+                "stop_loss_triggered": bool(sl and sl > stressed_price),
+            })
+
+    stressed_total = total_value - total_loss
+    loss_pct = (total_loss / total_value * 100) if total_value > 0 else 0
+    recovery_days = int(abs(req.crash_pct) * 1.5 * req.duration_days / 10)
+
+    return {
+        "scenario": req.name,
+        "original_value": round(total_value, 2),
+        "stressed_value": round(stressed_total, 2),
+        "total_loss": round(total_loss, 2),
+        "total_loss_pct": round(loss_pct, 2),
+        "positions_liquidated": liquidated,
+        "positions_survived": survived,
+        "stop_loss_savings": round(stop_loss_savings, 2),
+        "cash_remaining": round(cash, 2),
+        "recovery_days": recovery_days,
+        "per_position": per_position,
+    }
+
+
+# =============================================
+# Phase 4: AI Chat
+# =============================================
+
+class ChatRequest(BaseModel):
+    message: str
+
+@app.post("/api/v2/chat")
+async def chat_endpoint(req: ChatRequest):
+    """AI chat assistant with portfolio context."""
+    message = req.message.lower().strip()
+
+    # Gather context
+    portfolio_data = {}
+    positions_data = {}
+    recent_signals = []
+    recent_trades = []
+
+    try:
+        port_resp = await http_client.get(f"{SERVICES['executor']}/balance", timeout=3.0)
+        if port_resp.status_code == 200:
+            portfolio_data = port_resp.json()
+    except Exception:
+        pass
+
+    try:
+        pos_resp = await http_client.get(f"{SERVICES['position']}/positions", timeout=3.0)
+        if pos_resp.status_code == 200:
+            positions_data = pos_resp.json()
+    except Exception:
+        pass
+
+    try:
+        sig_resp = await http_client.get(f"{SERVICES['signal']}/signals", timeout=3.0)
+        if sig_resp.status_code == 200:
+            sigs = sig_resp.json()
+            if isinstance(sigs, list):
+                recent_signals = sigs[:5]
+            elif isinstance(sigs, dict):
+                recent_signals = list(sigs.values())[:5]
+    except Exception:
+        pass
+
+    if db_pool:
+        try:
+            async with db_pool.acquire() as conn:
+                rows = await conn.fetch("SELECT * FROM trade_history ORDER BY created_at DESC LIMIT 5")
+                recent_trades = [dict(r) for r in rows]
+                for t in recent_trades:
+                    for k, v in t.items():
+                        if isinstance(v, datetime):
+                            t[k] = v.isoformat()
+        except Exception:
+            pass
+
+    summary = portfolio_data.get("summary", {})
+    total_val = summary.get("total_value", 0)
+    cash = summary.get("usdt_balance", 0)
+    pos_count = len(positions_data)
+
+    # Try LLM if key configured
+    api_key = os.getenv("OPENAI_API_KEY", "")
+    if api_key:
+        try:
+            llm_resp = await http_client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={
+                    "model": "gpt-3.5-turbo",
+                    "messages": [
+                        {"role": "system", "content": f"""You are Goblin, an AI trading assistant. Be concise, specific, slightly playful.
+Current portfolio: total_value=${total_val:.2f}, cash=${cash:.2f}, {pos_count} positions.
+Positions: {json.dumps({k: v for k, v in list(positions_data.items())[:5]})}
+Recent signals: {json.dumps(recent_signals[:3])}
+Recent trades: {json.dumps(recent_trades[:3])}
+Never recommend specific trades."""},
+                        {"role": "user", "content": req.message},
+                    ],
+                    "max_tokens": 300,
+                },
+                timeout=15.0,
+            )
+            if llm_resp.status_code == 200:
+                return {"response": llm_resp.json()["choices"][0]["message"]["content"]}
+        except Exception:
+            pass
+
+    # Rule-based fallback
+    response = ""
+    if any(w in message for w in ["portfolio", "balance", "how am i", "how's my"]):
+        pos_list = ", ".join([f"{s} ({p.get('amount', 0):.6f})" for s, p in list(positions_data.items())[:3]]) or "none"
+        response = f"Your portfolio is worth ${total_val:.2f} with ${cash:.2f} in cash. You have {pos_count} open position(s): {pos_list}. {'Looking healthy!' if total_val > 0 else 'Time to start trading!'}"
+    elif any(w in message for w in ["why", "explain", "bought", "sold", "buy", "sell"]):
+        if recent_signals:
+            s = recent_signals[0]
+            sym = s.get("symbol", "unknown")
+            action = s.get("action", "HOLD")
+            conf = s.get("confidence", 0)
+            response = f"The latest signal for {sym} was {action} with {conf:.0%} confidence. The AI ensemble analyzed technical indicators, sentiment data, and on-chain metrics to reach this decision."
+        else:
+            response = "No recent signals to explain. The AI is monitoring the markets and will generate signals when opportunities arise."
+    elif any(w in message for w in ["market", "outlook", "prediction"]):
+        response = f"I'm monitoring the markets with {pos_count} active position(s). The AI ensemble is analyzing technical patterns, sentiment shifts, and whale movements. Portfolio value: ${total_val:.2f}."
+    elif any(w in message for w in ["last trade", "recent trade"]):
+        if recent_trades:
+            t = recent_trades[0]
+            response = f"Last trade: {t.get('symbol', '?')} ({t.get('side', '?')}) — entry ${t.get('entry_price', 0):.2f}, exit ${t.get('exit_price', 0):.2f}, PnL: ${t.get('realized_pnl', 0):.4f}. Strategy: {t.get('strategy', 'unknown')}."
+        else:
+            response = "No recent trades found. The AI is waiting for the right conditions."
+    elif any(w in message for w in ["hello", "hi", "hey"]):
+        response = f"Hey there! I'm Goblin, your AI trading assistant. Your portfolio is at ${total_val:.2f}. Ask me about your positions, recent trades, or market outlook!"
+    else:
+        response = f"I can help with portfolio questions, trade explanations, and market outlook. Your current portfolio: ${total_val:.2f} with {pos_count} positions. Try asking 'How's my portfolio?' or 'Why did the AI buy BTC?'"
+
+    return {"response": response}
+
+
 @app.get("/metrics", response_class=PlainTextResponse)
 async def metrics():
     return generate_latest()

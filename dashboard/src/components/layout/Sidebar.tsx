@@ -11,6 +11,9 @@ import {
   Coins,
   ScrollText,
   FlaskConical,
+  Radar,
+  Workflow,
+  History,
   Menu,
   X,
 } from "lucide-react";
@@ -19,9 +22,12 @@ import { cn } from "@/lib/utils";
 
 const navItems = [
   { href: "/", label: "Dashboard", icon: LayoutDashboard },
+  { href: "/war-room", label: "War Room", icon: Radar },
   { href: "/trading", label: "Trading", icon: CandlestickChart },
   { href: "/analytics", label: "Analytics", icon: BarChart3 },
   { href: "/backtesting", label: "Backtesting", icon: FlaskConical },
+  { href: "/strategy", label: "Strategy", icon: Workflow },
+  { href: "/replay", label: "Replay", icon: History },
   { href: "/sentiment", label: "Sentiment", icon: Brain },
   { href: "/goblin-coin", label: "GBLN Coin", icon: Coins },
   { href: "/system", label: "System", icon: Server },

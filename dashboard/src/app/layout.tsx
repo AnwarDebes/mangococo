@@ -11,6 +11,7 @@ import CursorTrail from "@/components/effects/CursorTrail";
 import CelebrationEffects from "@/components/effects/CelebrationEffects";
 import DynamicFavicon from "@/components/effects/DynamicFavicon";
 import KeyboardShortcuts from "@/components/modals/KeyboardShortcuts";
+import GoblinChat from "@/components/GoblinChat";
 
 export const metadata: Metadata = {
   title: "Goblin - AI Trading Dashboard",
@@ -32,6 +33,7 @@ export default function RootLayout({
           <CelebrationEffects />
           <DynamicFavicon />
           <KeyboardShortcuts />
+          <GoblinChat />
           <GoblinBackground />
           <div className="relative z-10 flex h-screen overflow-hidden">
             <Sidebar />

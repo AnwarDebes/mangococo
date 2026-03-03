@@ -4,6 +4,9 @@ import { useTrades } from "@/hooks/usePortfolio";
 import { formatPercent, cn, getPnlColor } from "@/lib/utils";
 import EquityCurve from "@/components/charts/EquityCurve";
 import TradeHistory from "@/components/panels/TradeHistory";
+import StressTest from "@/components/panels/StressTest";
+import StrategyLeaderboard from "@/components/panels/StrategyLeaderboard";
+import PerformanceReport from "@/components/panels/PerformanceReport";
 
 function StatCard({
   label,
@@ -175,6 +178,21 @@ export default function AnalyticsPage() {
           </div>
         )}
       </div>
+
+      {/* Strategy Leaderboard */}
+      <StrategyLeaderboard trades={trades ?? []} />
+
+      {/* Portfolio Stress Tester */}
+      <StressTest />
+
+      {/* Performance Report */}
+      <PerformanceReport
+        trades={trades ?? []}
+        sharpe={sharpe}
+        winRate={winRate}
+        maxDrawdown={maxDrawdown}
+        profitFactor={profitFactor}
+      />
 
       {/* Full Trade History */}
       <TradeHistory trades={trades} isLoading={isLoading} limit={50} />

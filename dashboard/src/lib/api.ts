@@ -7,6 +7,13 @@ import type {
   SignalExplanation,
   SystemHealth,
   Trade,
+  PredictionCone,
+  FactorRow,
+  WhaleData,
+  ReplayData,
+  StressResult,
+  StressScenario,
+  ChatMessage,
 } from "@/types";
 
 export const API_BASE =
@@ -629,5 +636,204 @@ export async function getAllTickers(): Promise<TickerPrice[]> {
   } catch (err) {
     console.error("[api] getAllTickers failed:", err);
     return [];
+  }
+}
+
+/* ── Phase 4: Prediction Cone ────────────────────────────────────── */
+
+export async function getPredictionCone(symbol: string = "BTCUSDT"): Promise<PredictionCone | null> {
+  try {
+    const data = await requestJson<unknown>(`/api/v2/prediction/cone?symbol=${encodeURIComponent(symbol)}`);
+    const row = asRecord(data);
+    const pred = asRecord(row.prediction);
+    const cone = asRecord(row.cone);
+    const h1 = asRecord(cone["1h"]);
+    const h4 = asRecord(cone["4h"]);
+    const h24 = asRecord(cone["24h"]);
+    return {
+      symbol: String(row.symbol || symbol),
+      current_price: asNumber(row.current_price),
+      prediction: {
+        direction: String(pred.direction) === "up" ? "up" : "down",
+        confidence: asNumber(pred.confidence, 0.5),
+      },
+      cone: {
+        "1h": { upper: asNumber(h1.upper), mid: asNumber(h1.mid), lower: asNumber(h1.lower) },
+        "4h": { upper: asNumber(h4.upper), mid: asNumber(h4.mid), lower: asNumber(h4.lower) },
+        "24h": { upper: asNumber(h24.upper), mid: asNumber(h24.mid), lower: asNumber(h24.lower) },
+      },
+      historical: Array.isArray(row.historical)
+        ? (row.historical as unknown[]).map((v) => asNumber(v))
+        : [],
+    };
+  } catch (err) {
+    console.error("[api] getPredictionCone failed:", err);
+    return null;
+  }
+}
+
+/* ── Phase 4: Factor Heatmap ─────────────────────────────────────── */
+
+export async function getPredictionFactors(): Promise<FactorRow[]> {
+  try {
+    const data = await requestJson<unknown>("/api/v2/prediction/factors");
+    if (!Array.isArray(data)) return [];
+    return (data as unknown[]).map((raw) => {
+      const row = asRecord(raw);
+      const factors: Record<string, { value: number; direction: "bullish" | "bearish" | "neutral"; description: string }> = {};
+      const rawFactors = asRecord(row.factors);
+      for (const [key, val] of Object.entries(rawFactors)) {
+        const f = asRecord(val);
+        const dir = String(f.direction || "neutral");
+        factors[key] = {
+          value: asNumber(f.value),
+          direction: dir === "bullish" ? "bullish" : dir === "bearish" ? "bearish" : "neutral",
+          description: String(f.description || ""),
+        };
+      }
+      return { symbol: String(row.symbol || ""), factors };
+    });
+  } catch (err) {
+    console.error("[api] getPredictionFactors failed:", err);
+    return [];
+  }
+}
+
+/* ── Phase 4: Whale Activity ─────────────────────────────────────── */
+
+export async function getWhaleActivity(limit: number = 20): Promise<WhaleData> {
+  const empty: WhaleData = {
+    transactions: [],
+    summary: { net_exchange_flow_btc: 0, net_exchange_flow_eth: 0, whale_sentiment: "neutral" },
+  };
+  try {
+    const data = await requestJson<unknown>(`/api/v2/whales?limit=${limit}`);
+    const row = asRecord(data);
+    const txs = Array.isArray(row.transactions) ? (row.transactions as unknown[]) : [];
+    const summary = asRecord(row.summary);
+    const ws = String(summary.whale_sentiment || "neutral");
+    return {
+      transactions: txs.map((raw) => {
+        const t = asRecord(raw);
+        const dir = String(t.direction || "transfer");
+        const sig = String(t.significance || "neutral");
+        return {
+          symbol: String(t.symbol || "BTC/USDT"),
+          amount_usd: asNumber(t.amount_usd),
+          direction: dir === "exchange_inflow" ? "exchange_inflow" : dir === "exchange_outflow" ? "exchange_outflow" : "transfer",
+          from_label: String(t.from_label || "Unknown"),
+          to_label: String(t.to_label || "Unknown"),
+          timestamp: toIso(t.timestamp),
+          significance: sig === "bullish" ? "bullish" : sig === "bearish" ? "bearish" : "neutral",
+        };
+      }),
+      summary: {
+        net_exchange_flow_btc: asNumber(summary.net_exchange_flow_btc),
+        net_exchange_flow_eth: asNumber(summary.net_exchange_flow_eth),
+        whale_sentiment: ws === "accumulation" ? "accumulation" : ws === "distribution" ? "distribution" : "neutral",
+      },
+    };
+  } catch (err) {
+    console.error("[api] getWhaleActivity failed:", err);
+    return empty;
+  }
+}
+
+/* ── Phase 4: Market Replay ──────────────────────────────────────── */
+
+export async function getReplayData(
+  symbol: string,
+  start: string,
+  end: string,
+): Promise<ReplayData> {
+  try {
+    const params = new URLSearchParams({ symbol, start, end });
+    const data = await requestJson<unknown>(`/api/v2/replay?${params.toString()}`);
+    const row = asRecord(data);
+    const events = Array.isArray(row.events) ? (row.events as unknown[]) : [];
+    return {
+      events: events.map((raw) => {
+        const e = asRecord(raw);
+        return {
+          type: (["candle", "signal", "trade"].includes(String(e.type)) ? String(e.type) : "candle") as "candle" | "signal" | "trade",
+          time: toIso(e.time),
+          open: asNumber(e.open),
+          high: asNumber(e.high),
+          low: asNumber(e.low),
+          close: asNumber(e.close),
+          volume: asNumber(e.volume),
+          symbol: String(e.symbol || ""),
+          action: toSignalAction(e.action),
+          confidence: asNumber(e.confidence),
+          side: String(e.side || ""),
+          price: asNumber(e.price),
+          amount: asNumber(e.amount),
+          pnl: asNumber(e.pnl),
+        };
+      }),
+      total_events: asNumber(row.total_events, events.length),
+    };
+  } catch (err) {
+    console.error("[api] getReplayData failed:", err);
+    return { events: [], total_events: 0 };
+  }
+}
+
+/* ── Phase 4: Stress Test ────────────────────────────────────────── */
+
+export async function runStressTest(scenario: StressScenario): Promise<StressResult | null> {
+  try {
+    const res = await fetch(`${API_BASE}/api/v2/stress-test`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(scenario),
+    });
+    if (!res.ok) throw new Error(`Stress test failed (${res.status})`);
+    const data = asRecord(await res.json());
+    return {
+      scenario: String(data.scenario || scenario.name),
+      original_value: asNumber(data.original_value),
+      stressed_value: asNumber(data.stressed_value),
+      total_loss: asNumber(data.total_loss),
+      total_loss_pct: asNumber(data.total_loss_pct),
+      positions_liquidated: asNumber(data.positions_liquidated),
+      positions_survived: asNumber(data.positions_survived),
+      stop_loss_savings: asNumber(data.stop_loss_savings),
+      cash_remaining: asNumber(data.cash_remaining),
+      recovery_days: asNumber(data.recovery_days),
+      per_position: Array.isArray(data.per_position)
+        ? (data.per_position as unknown[]).map((raw) => {
+            const p = asRecord(raw);
+            return {
+              symbol: String(p.symbol || ""),
+              original_value: asNumber(p.original_value),
+              stressed_value: asNumber(p.stressed_value),
+              loss: asNumber(p.loss),
+              stop_loss_triggered: Boolean(p.stop_loss_triggered),
+            };
+          })
+        : [],
+    };
+  } catch (err) {
+    console.error("[api] runStressTest failed:", err);
+    return null;
+  }
+}
+
+/* ── Phase 4: Chat ───────────────────────────────────────────────── */
+
+export async function sendChatMessage(message: string): Promise<string> {
+  try {
+    const res = await fetch(`${API_BASE}/api/v2/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message }),
+    });
+    if (!res.ok) throw new Error(`Chat failed (${res.status})`);
+    const data = asRecord(await res.json());
+    return String(data.response || "I couldn't process that request. Try asking about your portfolio or recent trades.");
+  } catch (err) {
+    console.error("[api] sendChatMessage failed:", err);
+    return "Sorry, I'm having trouble connecting to the server. Please try again.";
   }
 }

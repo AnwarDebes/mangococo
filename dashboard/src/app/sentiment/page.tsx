@@ -4,6 +4,7 @@ import { useQuery } from "@tanstack/react-query";
 import { getSentiment } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import SentimentGauge from "@/components/charts/SentimentGauge";
+import WhaleActivityFeed from "@/components/panels/WhaleActivityFeed";
 import type { SentimentData } from "@/types";
 
 export default function SentimentPage() {
@@ -83,24 +84,8 @@ export default function SentimentPage() {
         </div>
       </div>
 
-      {/* News / Sentiment Stream placeholder */}
-      <div className="card">
-        <h3 className="mb-4 font-semibold text-white">Recent News Sentiment</h3>
-        <div className="space-y-3">
-          {isLoading ? (
-            Array.from({ length: 3 }).map((_, i) => (
-              <div key={i} className="h-16 animate-pulse rounded bg-gray-700" />
-            ))
-          ) : (
-            <div className="flex flex-col items-center py-8 text-gray-500">
-              <p className="text-sm">News sentiment feed will appear here</p>
-              <p className="mt-1 text-xs text-gray-600">
-                Connect a news API to populate this section
-              </p>
-            </div>
-          )}
-        </div>
-      </div>
+      {/* Whale Activity Feed */}
+      <WhaleActivityFeed />
     </div>
   );
 }

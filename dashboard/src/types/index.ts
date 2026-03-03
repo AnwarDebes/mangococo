@@ -100,3 +100,133 @@ export interface SignalExplanation {
     risk_reward_ratio: number;
   };
 }
+
+/* ── Phase 4: War Room ───────────────────────────────────────────── */
+
+export interface PredictionCone {
+  symbol: string;
+  current_price: number;
+  prediction: { direction: "up" | "down"; confidence: number };
+  cone: {
+    "1h": { upper: number; mid: number; lower: number };
+    "4h": { upper: number; mid: number; lower: number };
+    "24h": { upper: number; mid: number; lower: number };
+  };
+  historical: number[];
+}
+
+export interface FactorCell {
+  value: number;
+  direction: "bullish" | "bearish" | "neutral";
+  description: string;
+}
+
+export interface FactorRow {
+  symbol: string;
+  factors: Record<string, FactorCell>;
+}
+
+/* ── Phase 4: Whale Activity ─────────────────────────────────────── */
+
+export interface WhaleTransaction {
+  symbol: string;
+  amount_usd: number;
+  direction: "exchange_inflow" | "exchange_outflow" | "transfer";
+  from_label: string;
+  to_label: string;
+  timestamp: string;
+  significance: "bullish" | "bearish" | "neutral";
+}
+
+export interface WhaleData {
+  transactions: WhaleTransaction[];
+  summary: {
+    net_exchange_flow_btc: number;
+    net_exchange_flow_eth: number;
+    whale_sentiment: "accumulation" | "distribution" | "neutral";
+  };
+}
+
+/* ── Phase 4: Market Replay ──────────────────────────────────────── */
+
+export interface ReplayEvent {
+  type: "candle" | "signal" | "trade";
+  time: string;
+  open?: number;
+  high?: number;
+  low?: number;
+  close?: number;
+  volume?: number;
+  symbol?: string;
+  action?: "BUY" | "SELL" | "HOLD";
+  confidence?: number;
+  side?: string;
+  price?: number;
+  amount?: number;
+  pnl?: number;
+}
+
+export interface ReplayData {
+  events: ReplayEvent[];
+  total_events: number;
+}
+
+/* ── Phase 4: Stress Test ────────────────────────────────────────── */
+
+export interface StressScenario {
+  name: string;
+  crash_pct: number;
+  duration_days: number;
+}
+
+export interface StressResult {
+  scenario: string;
+  original_value: number;
+  stressed_value: number;
+  total_loss: number;
+  total_loss_pct: number;
+  positions_liquidated: number;
+  positions_survived: number;
+  stop_loss_savings: number;
+  cash_remaining: number;
+  recovery_days: number;
+  per_position: Array<{
+    symbol: string;
+    original_value: number;
+    stressed_value: number;
+    loss: number;
+    stop_loss_triggered: boolean;
+  }>;
+}
+
+/* ── Phase 4: Strategy Builder ───────────────────────────────────── */
+
+export interface StrategyNode {
+  id: string;
+  type: "trigger" | "condition" | "action";
+  name: string;
+  category: string;
+  params: Record<string, number | string | boolean>;
+  x: number;
+  y: number;
+}
+
+export interface StrategyConnection {
+  id: string;
+  from: string;
+  to: string;
+}
+
+export interface StrategyGraph {
+  nodes: StrategyNode[];
+  connections: StrategyConnection[];
+}
+
+/* ── Phase 4: Chat ───────────────────────────────────────────────── */
+
+export interface ChatMessage {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  timestamp: string;
+}
