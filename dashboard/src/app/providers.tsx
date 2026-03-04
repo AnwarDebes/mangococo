@@ -3,9 +3,15 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useState, type ReactNode } from "react";
 import { useRealtimeUpdates } from "@/hooks/useRealtimeUpdates";
+import { useAlertEvaluator } from "@/hooks/useAlertEvaluator";
 
 function RealtimeUpdater() {
   useRealtimeUpdates();
+  return null;
+}
+
+function AlertEvaluator() {
+  useAlertEvaluator();
   return null;
 }
 
@@ -26,6 +32,7 @@ export default function Providers({ children }: { children: ReactNode }) {
   return (
     <QueryClientProvider client={queryClient}>
       <RealtimeUpdater />
+      <AlertEvaluator />
       {children}
     </QueryClientProvider>
   );

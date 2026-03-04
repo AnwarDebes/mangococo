@@ -7,15 +7,21 @@ import { useSSE } from "@/hooks/useSSE";
 import { useNotificationStore } from "@/stores/notificationStore";
 import EmergencyPanel from "@/components/panels/EmergencyPanel";
 import PriceTicker from "@/components/panels/PriceTicker";
+import AlertManager from "@/components/alerts/AlertManager";
 
 const API_BASE =
   process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080";
 
 const PAGE_NAMES: Record<string, string> = {
   "/": "Dashboard",
+  "/war-room": "War Room",
   "/trading": "Live Trading",
   "/analytics": "Analytics",
   "/backtesting": "Backtesting Lab",
+  "/strategy": "Strategy Builder",
+  "/replay": "Market Replay",
+  "/market": "Market Intelligence",
+  "/derivatives": "Derivatives Intelligence",
   "/sentiment": "Sentiment",
   "/goblin-coin": "GBLN Coin",
   "/system": "System",
@@ -123,6 +129,11 @@ export default function Header() {
           >
             {soundEnabled ? <Volume2 size={16} className="text-goblin-500" /> : <VolumeX size={16} />}
           </button>
+
+          {/* Smart Alerts */}
+          <div className="relative">
+            <AlertManager />
+          </div>
 
           {/* Notification bell */}
           <div ref={notifRef} className="relative">

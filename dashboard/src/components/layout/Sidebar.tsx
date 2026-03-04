@@ -14,6 +14,8 @@ import {
   Radar,
   Workflow,
   History,
+  Globe,
+  LineChart,
   Menu,
   X,
 } from "lucide-react";
@@ -28,6 +30,8 @@ const navItems = [
   { href: "/backtesting", label: "Backtesting", icon: FlaskConical },
   { href: "/strategy", label: "Strategy", icon: Workflow },
   { href: "/replay", label: "Replay", icon: History },
+  { href: "/market", label: "Market Intel", icon: Globe },
+  { href: "/derivatives", label: "Derivatives", icon: LineChart },
   { href: "/sentiment", label: "Sentiment", icon: Brain },
   { href: "/goblin-coin", label: "GBLN Coin", icon: Coins },
   { href: "/system", label: "System", icon: Server },

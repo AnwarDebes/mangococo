@@ -14,6 +14,19 @@ import type {
   StressResult,
   StressScenario,
   ChatMessage,
+  FearGreedData,
+  GlobalMarketData,
+  TopCoin,
+  DefiOverview,
+  StablecoinData,
+  BitcoinNetworkData,
+  DexVolumeData,
+  FundingData,
+  OpenInterestData,
+  LongShortData,
+  CorrelationData,
+  MultiTimeframeData,
+  BenchmarkData,
 } from "@/types";
 
 export const API_BASE =
@@ -836,4 +849,70 @@ export async function sendChatMessage(message: string): Promise<string> {
     console.error("[api] sendChatMessage failed:", err);
     return "Sorry, I'm having trouble connecting to the server. Please try again.";
   }
+}
+
+/* ── Phase 5: Market Intelligence ───────────────────────────────── */
+
+export async function getFearGreed(limit: number = 30): Promise<FearGreedData> {
+  return requestJson<FearGreedData>(`/api/v2/market/fear-greed?limit=${limit}`);
+}
+
+export async function getGlobalMarket(): Promise<GlobalMarketData> {
+  return requestJson<GlobalMarketData>("/api/v2/market/global");
+}
+
+export async function getTopCoins(limit: number = 20): Promise<TopCoin[]> {
+  return requestJson<TopCoin[]>(`/api/v2/market/top-coins?limit=${limit}`);
+}
+
+export async function getTrending(): Promise<{ coins: Array<{ item: { id: string; name: string; symbol: string; market_cap_rank: number; thumb: string; score: number; data?: { price_change_percentage_24h?: Record<string, number> } } }> }> {
+  return requestJson("/api/v2/market/trending");
+}
+
+export async function getDefiOverview(): Promise<DefiOverview> {
+  return requestJson<DefiOverview>("/api/v2/market/defi");
+}
+
+export async function getStablecoins(): Promise<StablecoinData> {
+  return requestJson<StablecoinData>("/api/v2/market/stablecoins");
+}
+
+export async function getBitcoinNetwork(): Promise<BitcoinNetworkData> {
+  return requestJson<BitcoinNetworkData>("/api/v2/market/bitcoin-network");
+}
+
+export async function getDexVolume(): Promise<DexVolumeData> {
+  return requestJson<DexVolumeData>("/api/v2/market/dex-volume");
+}
+
+/* ── Phase 5: Derivatives Intelligence ──────────────────────────── */
+
+export async function getDerivativesFunding(): Promise<FundingData> {
+  return requestJson<FundingData>("/api/v2/derivatives/funding");
+}
+
+export async function getOpenInterest(symbol: string = "BTCUSDT"): Promise<OpenInterestData> {
+  return requestJson<OpenInterestData>(`/api/v2/derivatives/open-interest?symbol=${encodeURIComponent(symbol)}`);
+}
+
+export async function getLongShort(symbol: string = "BTCUSDT"): Promise<LongShortData> {
+  return requestJson<LongShortData>(`/api/v2/derivatives/long-short?symbol=${encodeURIComponent(symbol)}`);
+}
+
+/* ── Phase 5: Correlation Matrix ────────────────────────────────── */
+
+export async function getCorrelations(period: string = "30d"): Promise<CorrelationData> {
+  return requestJson<CorrelationData>(`/api/v2/analytics/correlations?period=${encodeURIComponent(period)}`);
+}
+
+/* ── Phase 5: Multi-Timeframe ───────────────────────────────────── */
+
+export async function getMultiTimeframe(symbol: string = "BTCUSDT"): Promise<MultiTimeframeData> {
+  return requestJson<MultiTimeframeData>(`/api/v2/candles/multi?symbol=${encodeURIComponent(symbol)}`);
+}
+
+/* ── Phase 5: Benchmark ─────────────────────────────────────────── */
+
+export async function getBenchmark(days: number = 90): Promise<BenchmarkData> {
+  return requestJson<BenchmarkData>(`/api/v2/analytics/benchmark?days=${days}`);
 }

@@ -230,3 +230,187 @@ export interface ChatMessage {
   content: string;
   timestamp: string;
 }
+
+/* ── Phase 5: Market Intelligence ───────────────────────────────── */
+
+export interface FearGreedData {
+  data: Array<{
+    value: string;
+    value_classification: string;
+    timestamp: string;
+  }>;
+}
+
+export interface GlobalMarketData {
+  data: {
+    total_market_cap: Record<string, number>;
+    total_volume: Record<string, number>;
+    market_cap_percentage: Record<string, number>;
+    active_cryptocurrencies: number;
+    market_cap_change_percentage_24h_usd: number;
+  };
+}
+
+export interface TopCoin {
+  id: string;
+  symbol: string;
+  name: string;
+  image: string;
+  current_price: number;
+  market_cap: number;
+  market_cap_rank: number;
+  price_change_percentage_1h_in_currency: number;
+  price_change_percentage_24h_in_currency: number;
+  price_change_percentage_7d_in_currency: number;
+  sparkline_in_7d: { price: number[] };
+}
+
+export interface TrendingCoin {
+  item: {
+    id: string;
+    name: string;
+    symbol: string;
+    market_cap_rank: number;
+    thumb: string;
+    score: number;
+    data?: {
+      price_change_percentage_24h?: Record<string, number>;
+    };
+  };
+}
+
+export interface DefiOverview {
+  total_tvl: number;
+  top_protocols: Array<{
+    name: string;
+    tvl: number;
+    change_1d: number;
+    change_7d: number;
+    category: string;
+    logo: string;
+  }>;
+  top_chains: Array<{ name: string; tvl: number }>;
+}
+
+export interface StablecoinData {
+  total_supply: number;
+  top_stablecoins: Array<{
+    name: string;
+    symbol: string;
+    supply: number;
+    price: number;
+  }>;
+}
+
+export interface BitcoinNetworkData {
+  fees: {
+    fastestFee: number;
+    halfHourFee: number;
+    hourFee: number;
+    economyFee: number;
+    minimumFee: number;
+  };
+  mempool: {
+    count: number;
+    vsize: number;
+    total_fee: number;
+  };
+  mining: {
+    currentHashrate: number;
+    currentDifficulty: number;
+    hashrates: Array<{ timestamp: number; avgHashrate: number }>;
+  };
+  difficulty: {
+    progressPercent: number;
+    difficultyChange: number;
+    estimatedRetargetDate: number;
+    remainingBlocks: number;
+    previousRetarget: number;
+  };
+}
+
+export interface DexVolumeData {
+  chart: Array<[number, number]>;
+  total_24h: number;
+  top_dexs: Array<{
+    name: string;
+    volume_24h: number;
+    change_1d: number;
+  }>;
+}
+
+/* ── Phase 5: Derivatives Intelligence ──────────────────────────── */
+
+export interface FundingSymbol {
+  symbol: string;
+  mark_price: number;
+  current_rate: number;
+  next_funding_time: number;
+  history: Array<{ rate: number; time: number }>;
+}
+
+export interface FundingData {
+  symbols: FundingSymbol[];
+}
+
+export interface OpenInterestData {
+  current: { symbol: string; openInterest: string; time: number };
+  history: Array<{
+    symbol: string;
+    sumOpenInterest: string;
+    sumOpenInterestValue: string;
+    timestamp: number;
+  }>;
+}
+
+export interface LongShortData {
+  long_short_ratio: Array<{
+    symbol: string;
+    longShortRatio: string;
+    longAccount: string;
+    shortAccount: string;
+    timestamp: number;
+  }>;
+  taker_volume: Array<{
+    buySellRatio: string;
+    buyVol: string;
+    sellVol: string;
+    timestamp: number;
+  }>;
+}
+
+/* ── Phase 5: Correlation Matrix ────────────────────────────────── */
+
+export interface CorrelationData {
+  symbols: string[];
+  matrix: Record<string, Record<string, number>>;
+  period: string;
+  data_points: number;
+}
+
+/* ── Phase 5: Multi-Timeframe ───────────────────────────────────── */
+
+export interface MultiTimeframeCandle {
+  time: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+}
+
+export interface MultiTimeframeData {
+  "5m": MultiTimeframeCandle[];
+  "15m": MultiTimeframeCandle[];
+  "1h": MultiTimeframeCandle[];
+  "4h": MultiTimeframeCandle[];
+}
+
+/* ── Phase 5: Benchmark ─────────────────────────────────────────── */
+
+export interface BenchmarkData {
+  dates: string[];
+  btc: number[];
+  eth: number[];
+  data_points: number;
+}

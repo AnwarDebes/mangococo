@@ -7,6 +7,10 @@ import TradeHistory from "@/components/panels/TradeHistory";
 import StressTest from "@/components/panels/StressTest";
 import StrategyLeaderboard from "@/components/panels/StrategyLeaderboard";
 import PerformanceReport from "@/components/panels/PerformanceReport";
+import CorrelationMatrix from "@/components/analytics/CorrelationMatrix";
+import TradeCalendar from "@/components/analytics/TradeCalendar";
+import BenchmarkComparison from "@/components/analytics/BenchmarkComparison";
+import DrawdownChart from "@/components/analytics/DrawdownChart";
 
 function StatCard({
   label,
@@ -147,6 +151,18 @@ export default function AnalyticsPage() {
         <h3 className="mb-4 font-semibold text-white">Equity Curve</h3>
         <EquityCurve data={equityData} />
       </div>
+
+      {/* Drawdown Chart */}
+      <DrawdownChart trades={trades ?? []} />
+
+      {/* Benchmark Comparison */}
+      <BenchmarkComparison trades={trades ?? []} />
+
+      {/* Trade Calendar Heatmap */}
+      <TradeCalendar trades={trades ?? []} />
+
+      {/* Correlation Matrix */}
+      <CorrelationMatrix />
 
       {/* Strategy Distribution */}
       <div className="card">

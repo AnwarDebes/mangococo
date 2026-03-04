@@ -1439,6 +1439,398 @@ Never recommend specific trades."""},
     return {"response": response}
 
 
+# =============================================
+# Phase 5: Market Intelligence Hub
+# =============================================
+
+FUTURES_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT", "DOTUSDT"]
+
+
+@app.get("/api/v2/market/fear-greed")
+async def get_fear_greed(limit: int = 30):
+    """Fear & Greed Index from Alternative.me - free, no key required."""
+    try:
+        resp = await http_client.get(
+            f"https://api.alternative.me/fng/?limit={limit}&format=json",
+            timeout=10.0
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="External API timeout - Alternative.me")
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=502, detail=f"External API error: {e.response.status_code}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch fear & greed data: {str(e)}")
+
+
+@app.get("/api/v2/market/global")
+async def get_global_market():
+    """Global market data from CoinGecko - free, no key required."""
+    try:
+        resp = await http_client.get(
+            "https://api.coingecko.com/api/v3/global",
+            timeout=10.0
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="External API timeout - CoinGecko")
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=502, detail=f"External API error: {e.response.status_code}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch global market data: {str(e)}")
+
+
+@app.get("/api/v2/market/top-coins")
+async def get_top_coins(limit: int = 20):
+    """Top coins by market cap from CoinGecko - free, no key required."""
+    try:
+        resp = await http_client.get(
+            f"https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page={limit}&sparkline=true&price_change_percentage=1h,24h,7d",
+            timeout=10.0
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="External API timeout - CoinGecko")
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=502, detail=f"External API error: {e.response.status_code}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch top coins: {str(e)}")
+
+
+@app.get("/api/v2/market/trending")
+async def get_trending():
+    """Trending coins from CoinGecko - free, no key required."""
+    try:
+        resp = await http_client.get(
+            "https://api.coingecko.com/api/v3/search/trending",
+            timeout=10.0
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="External API timeout - CoinGecko")
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=502, detail=f"External API error: {e.response.status_code}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch trending coins: {str(e)}")
+
+
+@app.get("/api/v2/market/defi")
+async def get_defi_overview():
+    """DeFi overview from DeFiLlama - free, no key required."""
+    try:
+        protocols_resp = await http_client.get("https://api.llama.fi/protocols", timeout=10.0)
+        chains_resp = await http_client.get("https://api.llama.fi/chains", timeout=10.0)
+        protocols_resp.raise_for_status()
+        chains_resp.raise_for_status()
+        protocols = protocols_resp.json()
+        chains = chains_resp.json()
+
+        total_tvl = sum(c.get("tvl", 0) for c in chains)
+        top_protocols = sorted(protocols, key=lambda p: p.get("tvl", 0), reverse=True)[:10]
+        top_chains = sorted(chains, key=lambda c: c.get("tvl", 0), reverse=True)[:10]
+
+        return {
+            "total_tvl": total_tvl,
+            "top_protocols": [{"name": p["name"], "tvl": p.get("tvl", 0), "change_1d": p.get("change_1d", 0), "change_7d": p.get("change_7d", 0), "category": p.get("category", ""), "logo": p.get("logo", "")} for p in top_protocols],
+            "top_chains": [{"name": c["name"], "tvl": c.get("tvl", 0)} for c in top_chains],
+        }
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="External API timeout - DeFiLlama")
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=502, detail=f"External API error: {e.response.status_code}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch DeFi data: {str(e)}")
+
+
+@app.get("/api/v2/market/stablecoins")
+async def get_stablecoins():
+    """Stablecoin data from DeFiLlama - free, no key required."""
+    try:
+        resp = await http_client.get(
+            "https://stablecoins.llama.fi/stablecoins?includePrices=true",
+            timeout=10.0
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        pegged = data.get("peggedAssets", [])
+        top = sorted(pegged, key=lambda s: s.get("circulating", {}).get("peggedUSD", 0), reverse=True)[:10]
+        total = sum(s.get("circulating", {}).get("peggedUSD", 0) for s in pegged)
+        return {
+            "total_supply": total,
+            "top_stablecoins": [{"name": s["name"], "symbol": s["symbol"], "supply": s.get("circulating", {}).get("peggedUSD", 0), "price": s.get("price", 1.0)} for s in top],
+        }
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="External API timeout - DeFiLlama")
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=502, detail=f"External API error: {e.response.status_code}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch stablecoin data: {str(e)}")
+
+
+@app.get("/api/v2/market/bitcoin-network")
+async def get_bitcoin_network():
+    """Bitcoin network data from Mempool.space - free, no key required."""
+    try:
+        fees_resp = await http_client.get("https://mempool.space/api/v1/fees/recommended", timeout=10.0)
+        mempool_resp = await http_client.get("https://mempool.space/api/mempool", timeout=10.0)
+        hashrate_resp = await http_client.get("https://mempool.space/api/v1/mining/hashrate/1m", timeout=10.0)
+        diff_resp = await http_client.get("https://mempool.space/api/v1/difficulty-adjustment", timeout=10.0)
+
+        fees_resp.raise_for_status()
+        mempool_resp.raise_for_status()
+        hashrate_resp.raise_for_status()
+        diff_resp.raise_for_status()
+
+        return {
+            "fees": fees_resp.json(),
+            "mempool": mempool_resp.json(),
+            "mining": hashrate_resp.json(),
+            "difficulty": diff_resp.json(),
+        }
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="External API timeout - Mempool.space")
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=502, detail=f"External API error: {e.response.status_code}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch Bitcoin network data: {str(e)}")
+
+
+@app.get("/api/v2/market/dex-volume")
+async def get_dex_volume():
+    """DEX volume data from DeFiLlama - free, no key required."""
+    try:
+        resp = await http_client.get(
+            "https://api.llama.fi/overview/dexs?excludeTotalDataChart=false&excludeTotalDataChartBreakdown=true",
+            timeout=10.0
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        protocols = sorted(data.get("protocols", []), key=lambda p: p.get("total24h", 0) or 0, reverse=True)[:10]
+        return {
+            "chart": data.get("totalDataChart", []),
+            "total_24h": sum(p.get("total24h", 0) or 0 for p in data.get("protocols", [])),
+            "top_dexs": [{"name": p["name"], "volume_24h": p.get("total24h", 0), "change_1d": p.get("change_1d", 0)} for p in protocols],
+        }
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="External API timeout - DeFiLlama")
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=502, detail=f"External API error: {e.response.status_code}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch DEX volume data: {str(e)}")
+
+
+# =============================================
+# Phase 5: Derivatives Intelligence
+# =============================================
+
+@app.get("/api/v2/derivatives/funding")
+async def get_derivatives_funding():
+    """Funding rates from Binance Futures - public, no key required."""
+    try:
+        premium_resp = await http_client.get(
+            "https://fapi.binance.com/fapi/v1/premiumIndex",
+            timeout=10.0
+        )
+        premium_resp.raise_for_status()
+        all_premium = premium_resp.json()
+
+        tracked = {p["symbol"]: p for p in all_premium if p["symbol"] in FUTURES_SYMBOLS}
+
+        result = []
+        for sym in FUTURES_SYMBOLS:
+            hist_resp = await http_client.get(
+                f"https://fapi.binance.com/fapi/v1/fundingRate?symbol={sym}&limit=8",
+                timeout=10.0
+            )
+            hist_resp.raise_for_status()
+            history = hist_resp.json()
+
+            current = tracked.get(sym, {})
+            result.append({
+                "symbol": sym,
+                "mark_price": float(current.get("markPrice", 0)),
+                "current_rate": float(current.get("lastFundingRate", 0)),
+                "next_funding_time": current.get("nextFundingTime", 0),
+                "history": [{"rate": float(h["fundingRate"]), "time": h["fundingTime"]} for h in history],
+            })
+
+        return {"symbols": result}
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="External API timeout - Binance Futures")
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=502, detail=f"External API error: {e.response.status_code}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch funding rates: {str(e)}")
+
+
+@app.get("/api/v2/derivatives/open-interest")
+async def get_open_interest(symbol: str = "BTCUSDT"):
+    """Open interest from Binance Futures - public, no key required."""
+    try:
+        oi_resp = await http_client.get(
+            f"https://fapi.binance.com/fapi/v1/openInterest?symbol={symbol}",
+            timeout=10.0
+        )
+        oi_resp.raise_for_status()
+
+        hist_resp = await http_client.get(
+            f"https://fapi.binance.com/futures/data/openInterestHist?symbol={symbol}&period=1h&limit=48",
+            timeout=10.0
+        )
+        hist_resp.raise_for_status()
+
+        return {
+            "current": oi_resp.json(),
+            "history": hist_resp.json(),
+        }
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="External API timeout - Binance Futures")
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=502, detail=f"External API error: {e.response.status_code}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch open interest: {str(e)}")
+
+
+@app.get("/api/v2/derivatives/long-short")
+async def get_long_short(symbol: str = "BTCUSDT"):
+    """Long/short ratio from Binance Futures - public, no key required."""
+    try:
+        ratio_resp = await http_client.get(
+            f"https://fapi.binance.com/futures/data/topLongShortPositionRatio?symbol={symbol}&period=1h&limit=24",
+            timeout=10.0
+        )
+        taker_resp = await http_client.get(
+            f"https://fapi.binance.com/futures/data/takerlongshortRatio?symbol={symbol}&period=1h&limit=24",
+            timeout=10.0
+        )
+        ratio_resp.raise_for_status()
+        taker_resp.raise_for_status()
+
+        return {
+            "long_short_ratio": ratio_resp.json(),
+            "taker_volume": taker_resp.json(),
+        }
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="External API timeout - Binance Futures")
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=502, detail=f"External API error: {e.response.status_code}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch long/short data: {str(e)}")
+
+
+# =============================================
+# Phase 5: Correlation Matrix
+# =============================================
+
+@app.get("/api/v2/analytics/correlations")
+async def get_correlations(period: str = "30d"):
+    """Compute Pearson correlation between tracked assets using MEXC candle data."""
+    try:
+        import numpy as np
+
+        symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
+        days = {"7d": 7, "30d": 30, "90d": 90}.get(period, 30)
+        limit = min(days * 24, 1000)
+
+        returns_map: dict = {}
+        for sym in symbols:
+            resp = await http_client.get(
+                f"https://api.mexc.com/api/v3/klines?symbol={sym}&interval=60m&limit={limit}",
+                timeout=15.0
+            )
+            resp.raise_for_status()
+            klines = resp.json()
+            closes = [float(k[4]) for k in klines]
+            if len(closes) > 1:
+                returns_map[sym] = [(closes[i] - closes[i-1]) / closes[i-1] for i in range(1, len(closes))]
+
+        min_len = min(len(r) for r in returns_map.values()) if returns_map else 0
+        if min_len < 10:
+            raise HTTPException(status_code=400, detail="Insufficient data for correlation")
+
+        aligned = {s: r[-min_len:] for s, r in returns_map.items()}
+        sym_list = list(aligned.keys())
+        matrix = np.array([aligned[s] for s in sym_list])
+        corr = np.corrcoef(matrix)
+
+        result: dict = {}
+        for i, s1 in enumerate(sym_list):
+            result[s1] = {}
+            for j, s2 in enumerate(sym_list):
+                result[s1][s2] = round(float(corr[i][j]), 4)
+
+        return {"symbols": sym_list, "matrix": result, "period": period, "data_points": min_len}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to compute correlations: {str(e)}")
+
+
+# =============================================
+# Phase 5: Multi-Timeframe Candles
+# =============================================
+
+@app.get("/api/v2/candles/multi")
+async def get_multi_timeframe(symbol: str = "BTCUSDT"):
+    """Fetch 4 timeframes at once from MEXC - free, no key required."""
+    try:
+        timeframes = {"5m": "5m", "15m": "15m", "1h": "60m", "4h": "4h"}
+        result: dict = {}
+        for label, interval in timeframes.items():
+            resp = await http_client.get(
+                f"https://api.mexc.com/api/v3/klines?symbol={symbol}&interval={interval}&limit=100",
+                timeout=10.0
+            )
+            resp.raise_for_status()
+            klines = resp.json()
+            result[label] = [{"time": k[0] // 1000, "open": float(k[1]), "high": float(k[2]), "low": float(k[3]), "close": float(k[4]), "volume": float(k[5])} for k in klines]
+        return result
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="External API timeout - MEXC")
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=502, detail=f"External API error: {e.response.status_code}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch multi-timeframe data: {str(e)}")
+
+
+# =============================================
+# Phase 5: Benchmark Comparison
+# =============================================
+
+@app.get("/api/v2/analytics/benchmark")
+async def get_benchmark(days: int = 90):
+    """Fetch historical daily closes for BTC and ETH from MEXC for benchmark comparison."""
+    try:
+        result: dict = {"dates": [], "btc": [], "eth": []}
+        for sym, key in [("BTCUSDT", "btc"), ("ETHUSDT", "eth")]:
+            resp = await http_client.get(
+                f"https://api.mexc.com/api/v3/klines?symbol={sym}&interval=1d&limit={days}",
+                timeout=15.0
+            )
+            resp.raise_for_status()
+            klines = resp.json()
+            closes = [float(k[4]) for k in klines]
+            if closes:
+                start_price = closes[0]
+                normalized = [round((c / start_price) * 100, 2) for c in closes]
+                result[key] = normalized
+                if key == "btc":
+                    result["dates"] = [datetime.utcfromtimestamp(k[0] / 1000).strftime("%Y-%m-%d") for k in klines]
+
+        result["data_points"] = len(result["btc"])
+        return result
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="External API timeout - MEXC")
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=502, detail=f"External API error: {e.response.status_code}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch benchmark data: {str(e)}")
+
+
 @app.get("/metrics", response_class=PlainTextResponse)
 async def metrics():
     return generate_latest()
