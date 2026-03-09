@@ -7,6 +7,7 @@ import {
   CandlestickChart,
   BarChart3,
   Brain,
+  Orbit,
   Server,
   Coins,
   ScrollText,
@@ -24,6 +25,7 @@ import { cn } from "@/lib/utils";
 
 const navItems = [
   { href: "/", label: "Dashboard", icon: LayoutDashboard },
+  { href: "/nerve-center", label: "Nerve Center", icon: Orbit },
   { href: "/war-room", label: "War Room", icon: Radar },
   { href: "/trading", label: "Trading", icon: CandlestickChart },
   { href: "/analytics", label: "Analytics", icon: BarChart3 },
@@ -136,6 +138,7 @@ export default function Sidebar() {
               pathname === item.href ||
               (item.href !== "/" && pathname.startsWith(item.href));
             const isGbln = item.href === "/goblin-coin";
+            const isNerveCenter = item.href === "/nerve-center";
             return (
               <Link
                 key={item.href}
@@ -154,6 +157,11 @@ export default function Sidebar() {
                 {isGbln && (
                   <span className="ml-auto text-[9px] font-bold bg-gold-500/20 text-gold-400 px-1.5 py-0.5 rounded-full">
                     NEW
+                  </span>
+                )}
+                {isNerveCenter && (
+                  <span className="ml-auto text-[9px] font-bold bg-goblin-500/20 text-goblin-400 px-1.5 py-0.5 rounded-full">
+                    3D
                   </span>
                 )}
               </Link>
