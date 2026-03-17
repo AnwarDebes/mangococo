@@ -4,6 +4,7 @@ import { useState } from "react";
 import { usePortfolio, usePositions } from "@/hooks/usePortfolio";
 import { cn } from "@/lib/utils";
 import { formatCurrency, formatPercent, getTimeSince } from "@/lib/utils";
+import type { Position, PortfolioState } from "@/types";
 
 interface TreemapItem {
   symbol: string;
@@ -16,21 +17,37 @@ interface TreemapItem {
   isCash: boolean;
 }
 
-export default function PortfolioTreemap() {
-  const { data: portfolio } = usePortfolio();
-  const { data: positions = [] } = usePositions();
+interface PortfolioTreemapProps {
+  portfolio?: PortfolioState;
+  positions?: Position[];
+}
+
+export default function PortfolioTreemap({ portfolio: propPortfolio, positions: propPositions }: PortfolioTreemapProps) {
+  // Use props if provided, otherwise fetch own data (backwards compatible)
+  const { data: hookPortfolio } = usePortfolio();
+  const { data: hookPositions = [] } = usePositions();
+  const portfolio = propPortfolio ?? hookPortfolio;
+  const positions = propPositions ?? hookPositions;
   const [hovered, setHovered] = useState<string | null>(null);
 
-  const items: TreemapItem[] = positions.map((p) => ({
-    symbol: p.symbol,
-    value: p.current_price * p.amount,
-    pnlPct: p.entry_price > 0 ? ((p.current_price - p.entry_price) / p.entry_price) * 100 : 0,
-    entryPrice: p.entry_price,
-    currentPrice: p.current_price,
-    unrealizedPnl: p.unrealized_pnl,
-    openedAt: p.opened_at,
-    isCash: false,
-  }));
+  const items: TreemapItem[] = positions.map((p) => {
+    // Account for position side in PnL calculation
+    const rawPnlPct = p.entry_price > 0
+      ? ((p.current_price - p.entry_price) / p.entry_price) * 100
+      : 0;
+    const pnlPct = p.side === "long" ? rawPnlPct : -rawPnlPct;
+
+    return {
+      symbol: p.symbol,
+      value: p.current_price * p.amount,
+      pnlPct,
+      entryPrice: p.entry_price,
+      currentPrice: p.current_price,
+      unrealizedPnl: p.unrealized_pnl,
+      openedAt: p.opened_at,
+      isCash: false,
+    };
+  });
 
   if (portfolio && portfolio.cash_balance > 0) {
     items.push({

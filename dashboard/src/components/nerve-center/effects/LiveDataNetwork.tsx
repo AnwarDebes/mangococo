@@ -38,8 +38,8 @@ export default function LiveDataNetwork() {
     let idx = 0;
 
     for (const conn of ZONE_CONNECTIONS) {
-      const fromDef = getZoneById(conn.from as any);
-      const toDef = getZoneById(conn.to as any);
+      const fromDef = getZoneById(conn.from);
+      const toDef = getZoneById(conn.to);
       if (!fromDef || !toDef) continue;
 
       const start = new THREE.Vector3(...fromDef.position);

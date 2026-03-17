@@ -12,6 +12,7 @@ import CelebrationEffects from "@/components/effects/CelebrationEffects";
 import DynamicFavicon from "@/components/effects/DynamicFavicon";
 import KeyboardShortcuts from "@/components/modals/KeyboardShortcuts";
 import GoblinChat from "@/components/GoblinChat";
+import ErrorBoundary from "@/components/ErrorBoundary";
 import dynamic from "next/dynamic";
 
 const FamiliarOverlay = dynamic(() => import("@/components/familiar/FamiliarOverlay"), {
@@ -47,7 +48,9 @@ export default function RootLayout({
               <Header />
               <SafeguardsStrip />
               <main className="flex-1 overflow-x-hidden overflow-y-auto p-2 sm:p-4 lg:p-6">
-                <div className="animate-fade-in">{children}</div>
+                <ErrorBoundary>
+                  <div className="animate-fade-in">{children}</div>
+                </ErrorBoundary>
               </main>
             </div>
           </div>

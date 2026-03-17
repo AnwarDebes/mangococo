@@ -177,9 +177,9 @@ export default function GoblinCoinPage() {
             {[
               { label: "Token Name", value: "Goblin" },
               { label: "Symbol", value: "GBLN" },
-              { label: "Network", value: "Ethereum / BSC" },
+              { label: "Network", value: "Base" },
               { label: "Decimals", value: "18" },
-              { label: "Type", value: "ERC-20 / BEP-20" },
+              { label: "Type", value: "ERC-20" },
             ].map((item) => (
               <div
                 key={item.label}

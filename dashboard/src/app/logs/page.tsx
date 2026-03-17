@@ -60,10 +60,16 @@ export default function LogsPage() {
         <div className="flex items-center gap-2">
           {isLive && (
             <div className="flex items-center gap-1">
-              {["green", "amber", "blue", "purple", "red"].map((color, i) => (
+              {[
+                "bg-green-500",
+                "bg-amber-500",
+                "bg-blue-500",
+                "bg-purple-500",
+                "bg-red-500",
+              ].map((bgClass, i) => (
                 <span
-                  key={color}
-                  className={`w-1.5 h-1.5 rounded-full bg-${color}-500 animate-pulse`}
+                  key={bgClass}
+                  className={`w-1.5 h-1.5 rounded-full ${bgClass} animate-pulse`}
                   style={{ animationDelay: `${i * 0.2}s` }}
                 />
               ))}

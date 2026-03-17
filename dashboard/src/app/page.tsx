@@ -1,5 +1,6 @@
 "use client";
 
+import { useMemo } from "react";
 import {
   Trophy,
   TrendingUp,
@@ -16,6 +17,7 @@ import GoblinCoin3D from "@/components/3d/GoblinCoin3D";
 import PortfolioTreemap from "@/components/charts/PortfolioTreemap";
 import { useTilt } from "@/hooks/useTilt";
 import { useCountUp } from "@/hooks/useCountUp";
+import type { PortfolioState } from "@/types";
 
 function MetricCard({
   label,
@@ -57,9 +59,37 @@ function MetricCard({
 }
 
 export default function DashboardPage() {
-  const { data: portfolio, isLoading: loadingPortfolio } = usePortfolio();
+  const { data: rawPortfolio, isLoading: loadingPortfolio } = usePortfolio();
   const { data: positions, isLoading: loadingPositions } = usePositions();
   const { data: trades, isLoading: loadingTrades } = useTrades();
+
+  // Reconcile portfolio values with actual positions data so all numbers
+  // displayed on the dashboard are internally consistent.
+  const portfolio: PortfolioState | undefined = useMemo(() => {
+    if (!rawPortfolio) return undefined;
+
+    // Compute positions value from the actual positions array
+    const computedPositionsValue = positions
+      ? positions.reduce((sum, p) => sum + p.current_price * p.amount, 0)
+      : rawPortfolio.positions_value;
+
+    // Cash balance comes from the portfolio API (executor/risk service)
+    const cashBalance = rawPortfolio.cash_balance;
+
+    // Total value = cash + positions (ensures the equation always holds)
+    const totalValue = cashBalance + computedPositionsValue;
+
+    // Open positions count from the actual array
+    const openPositions = positions ? positions.length : rawPortfolio.open_positions;
+
+    return {
+      total_value: totalValue,
+      cash_balance: cashBalance,
+      positions_value: computedPositionsValue,
+      daily_pnl: rawPortfolio.daily_pnl,
+      open_positions: openPositions,
+    };
+  }, [rawPortfolio, positions]);
 
   const winRate =
     trades && trades.length > 0
@@ -144,7 +174,7 @@ export default function DashboardPage() {
       </div>
 
       {/* Portfolio Treemap */}
-      <PortfolioTreemap />
+      <PortfolioTreemap portfolio={portfolio} positions={positions} />
 
       {/* Open Positions */}
       <div>

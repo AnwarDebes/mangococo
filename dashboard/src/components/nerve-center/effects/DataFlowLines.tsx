@@ -4,7 +4,7 @@ import { useRef, useMemo } from "react";
 import { useFrame } from "@react-three/fiber";
 import { Line } from "@react-three/drei";
 import * as THREE from "three";
-import { ZONES, ZONE_CONNECTIONS, getZoneById } from "../zones/ZoneConfig";
+import { ZONE_CONNECTIONS, getZoneById, type ZoneId } from "../zones/ZoneConfig";
 
 /** Animated dashed flow lines connecting zones — the kingdom's nervous system */
 export default function DataFlowLines() {
@@ -23,13 +23,13 @@ function FlowLine({
   color,
   index,
 }: {
-  fromZone: string;
-  toZone: string;
+  fromZone: ZoneId;
+  toZone: ZoneId;
   color: string;
   index: number;
 }) {
-  const fromDef = getZoneById(fromZone as any);
-  const toDef = getZoneById(toZone as any);
+  const fromDef = getZoneById(fromZone);
+  const toDef = getZoneById(toZone);
   if (!fromDef || !toDef) return null;
 
   const points = useMemo(() => {

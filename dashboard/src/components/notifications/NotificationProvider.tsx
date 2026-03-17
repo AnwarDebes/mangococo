@@ -2,9 +2,8 @@
 
 import { useEffect, useRef, useCallback, useState } from "react";
 import { useNotificationStore } from "@/stores/notificationStore";
+import { API_BASE } from "@/lib/api";
 import ToastContainer from "./Toast";
-
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080";
 
 function playSound(type: "click" | "profit" | "loss") {
   try {

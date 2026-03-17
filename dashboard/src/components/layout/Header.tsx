@@ -5,15 +5,14 @@ import { usePathname } from "next/navigation";
 import { Wifi, WifiOff, Bell, Volume2, VolumeX, Shield, Search } from "lucide-react";
 import { useSSE } from "@/hooks/useSSE";
 import { useNotificationStore } from "@/stores/notificationStore";
+import { API_BASE } from "@/lib/api";
 import EmergencyPanel from "@/components/panels/EmergencyPanel";
 import PriceTicker from "@/components/panels/PriceTicker";
 import AlertManager from "@/components/alerts/AlertManager";
 
-const API_BASE =
-  process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080";
-
 const PAGE_NAMES: Record<string, string> = {
   "/": "Dashboard",
+  "/nerve-center": "Nerve Center",
   "/war-room": "War Room",
   "/trading": "Live Trading",
   "/analytics": "Analytics",
@@ -23,9 +22,10 @@ const PAGE_NAMES: Record<string, string> = {
   "/market": "Market Intelligence",
   "/derivatives": "Derivatives Intelligence",
   "/sentiment": "Sentiment",
+  "/goblin-shop": "Goblin Grand Bazaar",
   "/goblin-coin": "GBLN Coin",
-  "/system": "System",
-  "/logs": "Container Logs",
+  "/system": "System Analyzer",
+  "/logs": "AI Activity Logs",
 };
 
 export default function Header() {

@@ -17,7 +17,7 @@ export default function PriceChart() {
   const [currentPrice, setCurrentPrice] = useState<number | null>(null);
 
   // Fetch candles
-  const { data: candles = [] } = useQuery({
+  const { data: candles = [], isError: candleError } = useQuery({
     queryKey: ["candles", activeSymbol, activeInterval],
     queryFn: () => getCandles(activeSymbol, activeInterval, 200),
     refetchInterval: 30000,
@@ -193,7 +193,11 @@ export default function PriceChart() {
         {!isLoaded && (
           <div className="flex h-full items-center justify-center">
             <div className="text-sm text-gray-500">
-              {candles.length === 0 ? "Loading chart data..." : "Rendering chart..."}
+              {candleError
+                ? "Failed to load chart data. Retrying..."
+                : candles.length === 0
+                ? "Loading chart data..."
+                : "Rendering chart..."}
             </div>
           </div>
         )}

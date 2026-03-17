@@ -6,30 +6,37 @@ import { useShopData } from "./useShopData";
 import { useGoblinShopStore } from "./GoblinShopStore";
 import { generateTreasureMaps } from "@/lib/arena-utils";
 import DistrictNav from "./navigation/DistrictNav";
-import ForgeOfStrategies from "./districts/ForgeOfStrategies";
-import OracleEmporium from "./districts/OracleEmporium";
-import AlchemistWorkshop from "./districts/AlchemistWorkshop";
-import HallOfChampions from "./districts/HallOfChampions";
-import GoblinVault from "./districts/GoblinVault";
-import FamiliarDen from "./districts/FamiliarDen";
-import EnchantmentWorkshop from "./districts/EnchantmentWorkshop";
-import GoblinArena from "./districts/GoblinArena";
-import TreasureMaps from "./districts/TreasureMaps";
-import GuildHall from "./districts/GuildHall";
-import ProphecyChamber from "./districts/ProphecyChamber";
-import SkinWorkshop from "./districts/SkinWorkshop";
-import MysteryChests from "./features/MysteryChests";
-import WheelOfFortune from "./features/WheelOfFortune";
-import BattlePass from "./features/BattlePass";
 import ActivityFeed from "./features/ActivityFeed";
-import StrategyDetailModal from "./modals/StrategyDetailModal";
-import PurchaseModal from "./modals/PurchaseModal";
-import StakingModal from "./modals/StakingModal";
-import CraftingModal from "./modals/CraftingModal";
 import CoinCounter from "./effects/CoinCounter";
 import { cn } from "@/lib/utils";
 
+// 3D hero — SSR disabled (Three.js)
 const InteractiveBazaar3D = dynamic(() => import("./hero/InteractiveBazaar3D"), { ssr: false });
+
+// Districts — dynamically loaded (only one visible at a time)
+const ForgeOfStrategies = dynamic(() => import("./districts/ForgeOfStrategies"));
+const OracleEmporium = dynamic(() => import("./districts/OracleEmporium"));
+const AlchemistWorkshop = dynamic(() => import("./districts/AlchemistWorkshop"));
+const HallOfChampions = dynamic(() => import("./districts/HallOfChampions"));
+const GoblinVault = dynamic(() => import("./districts/GoblinVault"));
+const FamiliarDen = dynamic(() => import("./districts/FamiliarDen"), { ssr: false });
+const EnchantmentWorkshop = dynamic(() => import("./districts/EnchantmentWorkshop"));
+const GoblinArena = dynamic(() => import("./districts/GoblinArena"));
+const TreasureMaps = dynamic(() => import("./districts/TreasureMaps"));
+const GuildHall = dynamic(() => import("./districts/GuildHall"));
+const ProphecyChamber = dynamic(() => import("./districts/ProphecyChamber"));
+const SkinWorkshop = dynamic(() => import("./districts/SkinWorkshop"));
+
+// Features — dynamically loaded (only one visible at a time)
+const MysteryChests = dynamic(() => import("./features/MysteryChests"));
+const WheelOfFortune = dynamic(() => import("./features/WheelOfFortune"));
+const BattlePass = dynamic(() => import("./features/BattlePass"));
+
+// Modals — dynamically loaded (conditionally rendered)
+const StrategyDetailModal = dynamic(() => import("./modals/StrategyDetailModal"));
+const PurchaseModal = dynamic(() => import("./modals/PurchaseModal"));
+const StakingModal = dynamic(() => import("./modals/StakingModal"));
+const CraftingModal = dynamic(() => import("./modals/CraftingModal"));
 
 const TIER_STYLES: Record<string, { color: string; label: string }> = {
   bronze: { color: "text-orange-400", label: "🥉 Bronze" },

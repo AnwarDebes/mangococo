@@ -92,7 +92,7 @@ function mapPortfolio(payload: unknown): PortfolioState {
   );
   const posValue = asNumber(
     summary.positions_value,
-    asNumber(root.positions_value, asNumber(root.total_unrealized_pnl))
+    asNumber(root.positions_value)
   );
   const dailyPnl = asNumber(summary.daily_pnl, asNumber(root.daily_pnl));
   const openPositions = asNumber(
@@ -111,13 +111,25 @@ function mapPortfolio(payload: unknown): PortfolioState {
 
 function mapPosition(symbolKey: string, rawValue: unknown): Position {
   const row = asRecord(rawValue);
+  const side = toPositionSide(row.side);
+  const entryPrice = asNumber(row.entry_price);
+  const currentPrice = asNumber(row.current_price, asNumber(row.price, entryPrice));
+  const amount = asNumber(row.amount);
+
+  // Compute unrealized PnL from prices when not provided by the API
+  let unrealizedPnl = asNumber(row.unrealized_pnl);
+  if (unrealizedPnl === 0 && entryPrice > 0 && currentPrice > 0 && currentPrice !== entryPrice) {
+    const delta = (currentPrice - entryPrice) * amount;
+    unrealizedPnl = side === "long" ? delta : -delta;
+  }
+
   return {
     symbol: String(row.symbol || symbolKey || "").toUpperCase(),
-    side: toPositionSide(row.side),
-    entry_price: asNumber(row.entry_price),
-    current_price: asNumber(row.current_price, asNumber(row.price, asNumber(row.entry_price))),
-    amount: asNumber(row.amount),
-    unrealized_pnl: asNumber(row.unrealized_pnl),
+    side,
+    entry_price: entryPrice,
+    current_price: currentPrice,
+    amount,
+    unrealized_pnl: unrealizedPnl,
     stop_loss_price: asNumber(row.stop_loss_price),
     take_profit_price: asNumber(row.take_profit_price),
     opened_at: toIso(row.opened_at || row.entry_time || row.created_at),
@@ -217,23 +229,11 @@ export async function getPositions(): Promise<Position[]> {
     const balSummary = asRecord(root.summary);
     const summaryPositions = asRecord(balSummary.positions);
 
-    // If executor returns paper positions in summary.positions
+    // If executor returns paper positions in summary.positions, map through mapPosition
+    // for consistent field resolution (unrealized_pnl computation, etc.)
     if (Object.keys(summaryPositions).length > 0) {
       return Object.entries(summaryPositions)
-        .map(([symbol, value]) => {
-          const pos = asRecord(value);
-          return {
-            symbol: symbol.toUpperCase(),
-            side: "long" as const,
-            entry_price: asNumber(pos.price),
-            current_price: asNumber(pos.price),
-            amount: asNumber(pos.amount),
-            unrealized_pnl: 0,
-            stop_loss_price: 0,
-            take_profit_price: 0,
-            opened_at: new Date().toISOString(),
-          };
-        })
+        .map(([symbol, value]) => mapPosition(symbol, value))
         .filter((p) => p.amount > 0);
     }
 

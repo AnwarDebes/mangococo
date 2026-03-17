@@ -3,13 +3,13 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { useNerveCenterData } from "@/hooks/useNerveCenterData";
 import DataPacket from "./DataPacket";
-import { getZoneById } from "../zones/ZoneConfig";
+import { getZoneById, type ZoneId } from "../zones/ZoneConfig";
 
 /**
  * Zone position helpers — get the 3D world position (slightly elevated) for a zone.
  */
-function zonePos(zoneId: string): [number, number, number] {
-  const def = getZoneById(zoneId as any);
+function zonePos(zoneId: ZoneId): [number, number, number] {
+  const def = getZoneById(zoneId);
   if (!def) return [0, 2, 0];
   return [def.position[0], def.position[1] + 2, def.position[2]];
 }
