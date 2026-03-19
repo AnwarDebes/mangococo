@@ -27,6 +27,7 @@ POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", 5432))
 POSTGRES_DB = os.getenv("POSTGRES_DB", "goblin")
 POSTGRES_USER = os.getenv("POSTGRES_USER", "goblin")
 POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "")
+STARTING_CAPITAL = float(os.getenv("STARTING_CAPITAL", 1000.0))
 
 SERVICES = {
     "market_data": "http://localhost:8001",
@@ -108,6 +109,93 @@ async def periodic_ai_summary():
             logger.warning("Periodic AI summary failed", error=str(e))
 
 
+async def _take_portfolio_snapshot():
+    """Insert a portfolio snapshot into TimescaleDB. Reused by periodic and event-driven triggers."""
+    if db_pool is None or http_client is None:
+        return
+
+    total_value = 0.0
+    cash = 0.0
+    daily_pnl = 0.0
+
+    # Fetch from executor (primary source)
+    try:
+        bal_resp = await http_client.get(f"{SERVICES['executor']}/balance", timeout=5.0)
+        if bal_resp.status_code == 200:
+            bal_data = bal_resp.json()
+            summary = bal_data.get("summary", {})
+            total_value = float(summary.get("total_value", 0))
+            cash = float(summary.get("usdt_balance", 0))
+            daily_pnl = float(summary.get("pnl", 0))
+    except Exception:
+        pass
+
+    # Fallback to risk service
+    if total_value == 0:
+        try:
+            risk_resp = await http_client.get(f"{SERVICES['risk']}/portfolio", timeout=5.0)
+            if risk_resp.status_code == 200:
+                risk_data = risk_resp.json()
+                total_value = float(risk_data.get("total_value", 0))
+                cash = float(risk_data.get("available_capital", 0))
+                daily_pnl = float(risk_data.get("daily_pnl", 0))
+        except Exception:
+            pass
+
+    positions_value = max(0.0, total_value - cash)
+
+    if total_value > 0:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO portfolio_snapshots (time, total_value, cash_balance, positions_value, daily_pnl)
+                   VALUES (NOW(), $1, $2, $3, $4)""",
+                total_value, cash, positions_value, daily_pnl,
+            )
+        logger.debug("Portfolio snapshot saved", total_value=round(total_value, 2))
+
+
+async def periodic_portfolio_snapshot():
+    """Background task: write a portfolio snapshot every 5 minutes."""
+    while True:
+        try:
+            await asyncio.sleep(300)
+            await _take_portfolio_snapshot()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.warning("Portfolio snapshot failed", error=str(e))
+
+
+async def trade_event_snapshot_listener():
+    """Background task: listen for trade events on Redis and trigger immediate snapshots."""
+    backoff = 1
+    while True:
+        pubsub = None
+        try:
+            pubsub = redis_client.pubsub()
+            await pubsub.subscribe("trade_events", "position_closed")
+            backoff = 1
+            async for message in pubsub.listen():
+                if message["type"] == "message":
+                    try:
+                        await _take_portfolio_snapshot()
+                    except Exception as e:
+                        logger.debug("Event-driven snapshot failed", error=str(e))
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.warning("Trade event listener error", error=str(e))
+        finally:
+            if pubsub:
+                try:
+                    await pubsub.unsubscribe()
+                    await pubsub.close()
+                except Exception:
+                    pass
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, 30)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global redis_client, http_client
@@ -131,17 +219,20 @@ async def lifespan(app: FastAPI):
         },
     )
 
-    # Start periodic summary background task
+    # Start background tasks
     summary_task = asyncio.create_task(periodic_ai_summary())
+    snapshot_task = asyncio.create_task(periodic_portfolio_snapshot())
+    trade_snapshot_task = asyncio.create_task(trade_event_snapshot_listener())
 
     yield
 
-    # Cancel background task
-    summary_task.cancel()
-    try:
-        await summary_task
-    except asyncio.CancelledError:
-        pass
+    # Cancel background tasks
+    for task in (summary_task, snapshot_task, trade_snapshot_task):
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
     if http_client:
         await http_client.aclose()
@@ -431,11 +522,11 @@ async def get_signals_v2(limit: int = 20):
 async def get_analytics():
     """Get performance analytics for dashboard."""
     analytics = {
-        "sharpe_ratio": 0,
-        "sortino_ratio": 0,
+        "sharpe_ratio": None,
+        "sortino_ratio": None,
         "win_rate": 0,
         "profit_factor": 0,
-        "max_drawdown": 0,
+        "max_drawdown": None,
         "total_trades": 0,
         "total_return_pct": 0,
         "avg_hold_time_minutes": 0,
@@ -465,6 +556,83 @@ async def get_analytics():
                 analytics["win_rate"] = round(stats["winning_trades"] / stats["total_trades"], 4)
                 analytics["profit_factor"] = round(float(stats["total_profit"]) / float(stats["total_loss"]), 4)
                 analytics["avg_hold_time_minutes"] = round(float(stats["avg_hold_seconds"]) / 60, 2)
+
+            # Fetch per-trade returns for Sharpe / Sortino
+            pnl_rows = await conn.fetch(
+                "SELECT pnl_pct FROM trade_history WHERE pnl_pct IS NOT NULL ORDER BY created_at ASC"
+            )
+            returns = [float(r["pnl_pct"]) for r in pnl_rows]
+
+            if len(returns) >= 5:
+                avg_ret = sum(returns) / len(returns)
+
+                # Sharpe ratio: (mean / std) * sqrt(252)
+                variance = sum((r - avg_ret) ** 2 for r in returns) / (len(returns) - 1)
+                std_dev = variance ** 0.5 if variance > 0 else 0
+                if std_dev > 0:
+                    analytics["sharpe_ratio"] = round((avg_ret / std_dev) * 252 ** 0.5, 4)
+
+                # Sortino ratio: (mean / downside_dev) * sqrt(252)
+                negative_returns = [r for r in returns if r < 0]
+                if negative_returns:
+                    downside_var = sum(r ** 2 for r in negative_returns) / len(returns)
+                    downside_dev = downside_var ** 0.5
+                    if downside_dev > 0:
+                        analytics["sortino_ratio"] = round((avg_ret / downside_dev) * 252 ** 0.5, 4)
+
+            # Max drawdown from portfolio snapshots (walk peak-to-trough)
+            snapshots = await conn.fetch(
+                "SELECT time, total_value FROM portfolio_snapshots ORDER BY time ASC"
+            )
+            if len(snapshots) > 1:
+                peak = 0.0
+                max_dd = 0.0
+                for snap in snapshots:
+                    val = float(snap["total_value"])
+                    if val > peak:
+                        peak = val
+                    if peak > 0:
+                        dd = (val - peak) / peak * 100
+                        if dd < max_dd:
+                            max_dd = dd
+                analytics["max_drawdown"] = round(max_dd, 4)
+            elif returns:
+                # Fallback: reconstruct equity from trades + starting capital
+                equity_val = STARTING_CAPITAL
+                peak = equity_val
+                max_dd = 0.0
+                for r in returns:
+                    equity_val *= (1 + r / 100)
+                    if equity_val > peak:
+                        peak = equity_val
+                    if peak > 0:
+                        dd = (equity_val - peak) / peak * 100
+                        if dd < max_dd:
+                            max_dd = dd
+                analytics["max_drawdown"] = round(max_dd, 4)
+
+            # Total return percentage
+            if len(snapshots) > 1:
+                first_val = float(snapshots[0]["total_value"])
+                last_val = float(snapshots[-1]["total_value"])
+                if first_val > 0:
+                    analytics["total_return_pct"] = round((last_val - first_val) / first_val * 100, 4)
+            elif stats and float(stats["total_pnl"]) != 0:
+                analytics["total_return_pct"] = round(float(stats["total_pnl"]) / STARTING_CAPITAL * 100, 4)
+
+            # Monthly returns
+            monthly_rows = await conn.fetch("""
+                SELECT date_trunc('month', closed_at) as month,
+                       sum(realized_pnl) as monthly_pnl
+                FROM trade_history
+                WHERE closed_at IS NOT NULL
+                GROUP BY date_trunc('month', closed_at)
+                ORDER BY month ASC
+            """)
+            analytics["monthly_returns"] = {
+                r["month"].strftime("%Y-%m"): round(float(r["monthly_pnl"]), 4)
+                for r in monthly_rows
+            }
 
             # Equity curve from portfolio snapshots
             equity = await conn.fetch("""
@@ -623,8 +791,9 @@ async def run_backtest(
 @app.get("/api/v2/system")
 async def get_system_health():
     """Get comprehensive system health for dashboard."""
-    services = []
-    for name, url in SERVICES.items():
+    import asyncio
+
+    async def _check_service(name: str, url: str) -> dict:
         entry = {"name": name, "url": url, "status": "unknown", "uptime": None, "last_heartbeat": None}
         try:
             response = await http_client.get(f"{url}/health", timeout=5.0)
@@ -641,7 +810,13 @@ async def get_system_health():
         except Exception as e:
             entry["status"] = "down"
             entry["error"] = str(e)
-        services.append(entry)
+        return entry
+
+    # Check all services in parallel instead of sequentially.
+    # Worst case is now 5s (single timeout) instead of 55s (11 × 5s).
+    services = await asyncio.gather(
+        *[_check_service(name, url) for name, url in SERVICES.items()]
+    )
 
     # Redis info
     redis_info = {}

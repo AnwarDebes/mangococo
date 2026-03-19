@@ -100,6 +100,8 @@ class EnsembleCombiner:
         xgb_pred: Optional[ModelPrediction] = None,
         sentiment_score: float = 0.0,
         onchain_score: float = 0.0,
+        sentiment_available: bool = True,
+        onchain_available: bool = True,
     ) -> EnsemblePrediction:
         """
         Combine predictions from all sources into a single ensemble prediction.
@@ -114,6 +116,10 @@ class EnsembleCombiner:
             Normalised sentiment score in [-1, 1].
         onchain_score : float
             Normalised on-chain score in [-1, 1].
+        sentiment_available : bool
+            Whether sentiment data came from a real source (not defaults).
+        onchain_available : bool
+            Whether on-chain data came from a real source (not defaults).
 
         Returns
         -------
@@ -137,17 +143,26 @@ class EnsembleCombiner:
             total_weight += self.WEIGHT_XGB
             breakdown["xgboost"] = xgb_score
 
-        # Sentiment contribution
-        clamped_sentiment = max(-1.0, min(1.0, sentiment_score))
-        weighted_score += self.WEIGHT_SENTIMENT * clamped_sentiment
-        total_weight += self.WEIGHT_SENTIMENT
-        breakdown["sentiment"] = clamped_sentiment
+        # Sentiment contribution — skip if using default zeros
+        if sentiment_available:
+            clamped_sentiment = max(-1.0, min(1.0, sentiment_score))
+            weighted_score += self.WEIGHT_SENTIMENT * clamped_sentiment
+            total_weight += self.WEIGHT_SENTIMENT
+            breakdown["sentiment"] = clamped_sentiment
+        else:
+            breakdown["sentiment"] = 0.0
 
-        # On-chain contribution
-        clamped_onchain = max(-1.0, min(1.0, onchain_score))
-        weighted_score += self.WEIGHT_ONCHAIN * clamped_onchain
-        total_weight += self.WEIGHT_ONCHAIN
-        breakdown["onchain"] = clamped_onchain
+        # On-chain contribution — skip if using default zeros
+        if onchain_available:
+            clamped_onchain = max(-1.0, min(1.0, onchain_score))
+            weighted_score += self.WEIGHT_ONCHAIN * clamped_onchain
+            total_weight += self.WEIGHT_ONCHAIN
+            breakdown["onchain"] = clamped_onchain
+        else:
+            breakdown["onchain"] = 0.0
+
+        breakdown["sentiment_available"] = 1.0 if sentiment_available else 0.0
+        breakdown["onchain_available"] = 1.0 if onchain_available else 0.0
 
         # Normalise
         if total_weight > 0:

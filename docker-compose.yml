@@ -88,11 +88,19 @@ services:
       FEATURE_STORE_URL: http://feature-store:8007
       MODEL_DIR: /app/shared/models
       TRADING_PAIRS_FILE: /config/trading_pairs.txt
+      NVIDIA_VISIBLE_DEVICES: all
     ports:
       - "8002:8002"
     volumes:
       - ./shared/models:/app/shared/models
       - ./config:/config:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     depends_on:
       redis:
         condition: service_healthy

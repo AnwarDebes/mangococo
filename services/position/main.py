@@ -1,34 +1,56 @@
 """
-Position Manager Service - Tracks all open positions
+Position Manager Service - AI-Driven Exit Strategy (v2.0)
+
+Positions are opened/closed ONLY by AI prediction signals.
+No hardcoded stop-loss, take-profit, max-hold-time, or trailing stops.
+A circuit-breaker at -15% exists as an emergency data-integrity safety net.
+
+v2.0: Adaptive exit pressure — thresholds adjust per regime and volatility.
+  - Trending markets: harder to exit (let winners run)
+  - Choppy/high-vol: easier to exit (cut fast)
+  - Volatility risk floor: large ATR-relative losses increase exit urgency
 """
 import asyncio
 import json
 import os
+import sys
 from datetime import datetime, timedelta
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 from contextlib import asynccontextmanager
+from collections import defaultdict
 
 import redis.asyncio as aioredis
 import structlog
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
-from prometheus_client import Gauge, generate_latest
+from prometheus_client import Gauge, Counter, generate_latest
+
+# Import strategy modules for adaptive exits
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from strategy.regime import RegimeState
+from strategy.adaptive_exit import compute_adaptive_exit_params, explain_exit
 
 # Configuration
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "")
-PROFIT_TARGET_PCT = float(os.getenv("PROFIT_TARGET_PCT", 0.03))  # 3% profit target (safety net - AI decides primary exits)
-MAX_TRADE_LOSS_PCT = float(os.getenv("MAX_TRADE_LOSS_PCT", 0.05))  # 5% stop loss (safety net only)
-MAX_HOLD_TIME_MINUTES = float(os.getenv("MAX_HOLD_TIME_MINUTES", 120))  # 2 hours max hold
 AI_EXIT_CONFIDENCE = float(os.getenv("AI_EXIT_CONFIDENCE", 0.20))  # Min confidence for AI-driven exit
+CIRCUIT_BREAKER_PCT = float(os.getenv("CIRCUIT_BREAKER_PCT", 0.15))  # Emergency-only: -15% unrealized loss
+
+# Exit pressure configuration (AI signal persistence)
+EXIT_PRESSURE_THRESHOLD = float(os.getenv("EXIT_PRESSURE_THRESHOLD", 1.5))  # Cumulative pressure to trigger exit
+EXIT_PRESSURE_DECAY = float(os.getenv("EXIT_PRESSURE_DECAY", 0.3))  # Pressure decay per non-sell prediction
+MIN_SELL_SIGNALS_BEFORE_EXIT = int(os.getenv("MIN_SELL_SIGNALS_BEFORE_EXIT", 2))  # Minimum consecutive sell signals
 
 logger = structlog.get_logger()
 
 # Metrics
 POSITION_VALUE = Gauge("position_value", "Position value", ["symbol"])
 TOTAL_PNL = Gauge("position_total_pnl", "Total P&L")
+AI_EXIT_PRESSURE = Gauge("position_ai_exit_pressure", "Current AI exit pressure", ["symbol"])
+AI_EXITS_TOTAL = Counter("position_ai_exits_total", "AI-driven exits", ["reason"])
+CIRCUIT_BREAKER_EXITS = Counter("position_circuit_breaker_exits_total", "Circuit breaker emergency exits")
 
 
 class Position(BaseModel):
@@ -41,18 +63,115 @@ class Position(BaseModel):
     realized_pnl: float = 0
     status: str = "open"
     opened_at: str = ""
-    stop_loss_price: Optional[float] = None
-    take_profit_price: Optional[float] = None
-    max_hold_time_minutes: Optional[float] = None
-    # Trailing stop-loss fields
-    trailing_stop_activated: bool = False
-    highest_price: Optional[float] = None  # Track highest price for trailing stop
-    trailing_stop_distance_pct: float = 0.01  # 1% trailing distance
+
+
+class ExitPressureTracker:
+    """Tracks cumulative AI exit pressure per symbol with adaptive thresholds.
+
+    v2.0: Thresholds adapt based on regime and volatility state:
+      - Trending markets: higher threshold, slower decay (let winners run)
+      - Choppy/high-vol: lower threshold, faster decay (cut fast)
+      - Volatility risk floor: large ATR-relative losses boost urgency
+
+    Pressure formula per prediction (uses adaptive weights from regime):
+      sell:        +confidence * sell_weight (default 0.6, regime-adjusted)
+      strong_sell: +confidence * strong_sell_weight (default 1.0, regime-adjusted)
+      hold:        -decay_rate
+      buy/strong_buy: -decay_rate * 1.5
+
+    Context modifiers:
+      Position losing > 2%: pressure * 1.3 (cut losers faster)
+      Position profitable > 1%: pressure * 0.8 (let winners run)
+      High confidence (>70%): pressure * 1.2
+    """
+
+    def __init__(self):
+        self.pressure: Dict[str, float] = defaultdict(float)
+        self.consecutive_sells: Dict[str, int] = defaultdict(int)
+        self.last_directions: Dict[str, List[str]] = defaultdict(list)
+        self.last_adaptive_params: Dict[str, dict] = {}  # Last params used per symbol
+
+    def update(
+        self, symbol: str, direction: str, confidence: float, pnl_pct: float,
+        sell_weight: float = 0.6, strong_sell_weight: float = 1.0,
+        decay_rate: float = 0.3, pressure_threshold: float = 1.5,
+        min_consecutive_sells: int = 2, vol_urgency: float = 0.0,
+    ) -> tuple[float, bool]:
+        """Update exit pressure with adaptive parameters and return (pressure, should_exit)."""
+
+        if direction in ("sell", "strong_sell"):
+            # Base pressure contribution — using adaptive weights
+            weight = strong_sell_weight if direction == "strong_sell" else sell_weight
+            base = confidence * weight
+
+            # Context modifiers
+            if pnl_pct < -0.02:
+                base *= 1.3
+            elif pnl_pct > 0.01:
+                base *= 0.8
+
+            if confidence > 0.7:
+                base *= 1.2
+
+            # Volatility urgency boost: if vol_urgency > 0, loss exceeds ATR risk floor
+            if vol_urgency > 0:
+                base *= (1.0 + vol_urgency * 0.5)
+
+            self.pressure[symbol] += base
+            self.consecutive_sells[symbol] += 1
+        else:
+            # Non-sell prediction → decay pressure (adaptive decay rate)
+            decay_mult = 1.5 if direction in ("buy", "strong_buy") else 1.0
+            self.pressure[symbol] = max(0, self.pressure[symbol] - decay_rate * decay_mult)
+            self.consecutive_sells[symbol] = 0
+
+        # Track last 10 directions for analysis
+        self.last_directions[symbol].append(direction)
+        if len(self.last_directions[symbol]) > 10:
+            self.last_directions[symbol] = self.last_directions[symbol][-10:]
+
+        pressure = self.pressure[symbol]
+        should_exit = (
+            pressure >= pressure_threshold and
+            self.consecutive_sells[symbol] >= min_consecutive_sells
+        )
+
+        # Store the adaptive params used for debugging/metrics
+        self.last_adaptive_params[symbol] = {
+            "pressure_threshold": pressure_threshold,
+            "min_consecutive_sells": min_consecutive_sells,
+            "decay_rate": decay_rate,
+            "sell_weight": sell_weight,
+            "strong_sell_weight": strong_sell_weight,
+            "vol_urgency": vol_urgency,
+        }
+
+        return pressure, should_exit
+
+    def reset(self, symbol: str):
+        """Reset tracking for a symbol (after position closes)."""
+        self.pressure.pop(symbol, None)
+        self.consecutive_sells.pop(symbol, None)
+        self.last_directions.pop(symbol, None)
+        self.last_adaptive_params.pop(symbol, None)
+
+    def get_state(self, symbol: str) -> dict:
+        """Return current exit pressure state for debugging/metrics."""
+        adaptive = self.last_adaptive_params.get(symbol, {})
+        return {
+            "pressure": round(self.pressure.get(symbol, 0), 4),
+            "consecutive_sells": self.consecutive_sells.get(symbol, 0),
+            "last_directions": self.last_directions.get(symbol, []),
+            "threshold": adaptive.get("pressure_threshold", EXIT_PRESSURE_THRESHOLD),
+            "min_consecutive": adaptive.get("min_consecutive_sells", MIN_SELL_SIGNALS_BEFORE_EXIT),
+            "adaptive_params": adaptive,
+        }
 
 
 # Global State
 redis_client: Optional[aioredis.Redis] = None
 positions: Dict[str, Position] = {}
+exit_tracker = ExitPressureTracker()
 
 
 async def handle_filled_order(order: dict):
@@ -114,52 +233,15 @@ async def handle_filled_order(order: dict):
             pos.entry_price = total_cost / pos.amount
             logger.info("Position increased", symbol=symbol, new_amount=pos.amount, avg_entry=pos.entry_price)
     else:
-        # Opening new position - set stop-loss and take-profit levels
-        # Fetch risk parameters from Redis (set by risk service) or use defaults
-        risk_params_str = await redis_client.get("risk_parameters")
-        if risk_params_str:
-            risk_params = json.loads(risk_params_str)
-            profit_target = risk_params.get("PROFIT_TARGET_PCT", PROFIT_TARGET_PCT)
-            max_loss = risk_params.get("MAX_TRADE_LOSS_PCT", MAX_TRADE_LOSS_PCT)
-            max_hold = risk_params.get("MAX_HOLD_TIME_MINUTES", MAX_HOLD_TIME_MINUTES)
-        else:
-            profit_target = PROFIT_TARGET_PCT
-            max_loss = MAX_TRADE_LOSS_PCT
-            max_hold = MAX_HOLD_TIME_MINUTES
-        
-        # Check for dynamic profit target from prediction service (ATR-based)
-        dynamic_target_key = f"profit_target:{symbol}"
-        dynamic_target_str = await redis_client.get(dynamic_target_key)
-        if dynamic_target_str:
-            try:
-                dynamic_target = float(dynamic_target_str) / 100.0  # Convert from percentage to decimal
-                # Use dynamic target if it's reasonable (between 0.05% and 5%)
-                if 0.0005 <= dynamic_target <= 0.05:
-                    profit_target = dynamic_target
-                    logger.info(f"Using dynamic profit target for {symbol}: {profit_target:.4%} (ATR-based)")
-            except (ValueError, TypeError):
-                pass  # Fall back to default if parsing fails
-        
-        # Calculate stop-loss and take-profit prices
-        if side == "long":
-            stop_loss_price = order_price * (1 - max_loss)
-            take_profit_price = order_price * (1 + profit_target)
-        else:  # short
-            stop_loss_price = order_price * (1 + max_loss)
-            take_profit_price = order_price * (1 - profit_target)
-        
+        # Opening new position — AI controls all exits, no hardcoded thresholds
         positions[symbol] = Position(
             symbol=symbol, side=side, entry_price=order_price,
             current_price=order_price, amount=filled_amount, opened_at=datetime.utcnow().isoformat(),
-            stop_loss_price=stop_loss_price, take_profit_price=take_profit_price,
-            max_hold_time_minutes=max_hold,
-            trailing_stop_activated=False,
-            highest_price=order_price,  # Initialize tracking for trailing stop
-            trailing_stop_distance_pct=0.003  # 0.3% trailing distance
         )
+        # Reset exit pressure tracking for this symbol
+        exit_tracker.reset(symbol)
         await redis_client.publish("position_opened", json.dumps({"symbol": symbol, "side": side, "amount": filled_amount, "price": order_price}))
-        logger.info("Position opened", symbol=symbol, side=side, amount=filled_amount, price=order_price, 
-                    stop_loss=stop_loss_price, take_profit=take_profit_price, max_hold_minutes=max_hold)
+        logger.info("Position opened (AI-exit mode)", symbol=symbol, side=side, amount=filled_amount, price=order_price)
 
     # Always update Redis with current position state
     await redis_client.hset("positions", symbol, positions[symbol].model_dump_json())
@@ -276,44 +358,20 @@ async def close_position(symbol: str, reason: str):
 
 
 async def update_prices():
-    """Update position prices in real-time (microsecond-level) with stop-loss/take-profit checks"""
+    """Update position prices in real-time. No mechanical exits — AI controls exits.
+
+    Only the circuit breaker (-15% unrealized) triggers here as an emergency safety net.
+    All normal exits come from listen_for_prediction_exits() via AI signals.
+    """
     global positions
     while True:
-        await asyncio.sleep(0.1)  # Ultra-fast price updates every 100ms
-        positions_to_close = []
-        
-        # Fetch risk parameters once per cycle (they're cached in Redis)
-        risk_params_str = await redis_client.get("risk_parameters")
-        if risk_params_str:
-            risk_params = json.loads(risk_params_str)
-            profit_target = risk_params.get("PROFIT_TARGET_PCT", PROFIT_TARGET_PCT)
-            max_loss = risk_params.get("MAX_TRADE_LOSS_PCT", MAX_TRADE_LOSS_PCT)
-            max_hold = risk_params.get("MAX_HOLD_TIME_MINUTES", MAX_HOLD_TIME_MINUTES)
-        else:
-            profit_target = PROFIT_TARGET_PCT
-            max_loss = MAX_TRADE_LOSS_PCT
-            max_hold = MAX_HOLD_TIME_MINUTES
-        
+        await asyncio.sleep(0.5)  # Price updates every 500ms (sufficient for AI-driven exits)
+        circuit_breaker_triggered = []
+
         for symbol, pos in list(positions.items()):
             if pos.status != "open":
                 continue
-            
-            # If position doesn't have stop-loss/take-profit set, add them now
-            needs_update = pos.stop_loss_price is None or pos.take_profit_price is None
-            if needs_update:
-                if pos.side == "long":
-                    pos.stop_loss_price = pos.entry_price * (1 - max_loss)
-                    pos.take_profit_price = pos.entry_price * (1 + profit_target)
-                else:  # short
-                    pos.stop_loss_price = pos.entry_price * (1 + max_loss)
-                    pos.take_profit_price = pos.entry_price * (1 - profit_target)
-                logger.warning("Added stop-loss/take-profit to existing position", symbol=symbol,
-                           stop_loss=pos.stop_loss_price, take_profit=pos.take_profit_price,
-                           entry=pos.entry_price, side=pos.side, max_loss=max_loss, profit_target=profit_target)
-            
-            if pos.max_hold_time_minutes is None:
-                pos.max_hold_time_minutes = max_hold
-            
+
             tick_data = await redis_client.hget("latest_ticks", symbol)
             if tick_data:
                 tick = json.loads(tick_data)
@@ -322,7 +380,7 @@ async def update_prices():
                 pos.unrealized_pnl = (pos.current_price - pos.entry_price) * pos.amount if pos.side == "long" else (pos.entry_price - pos.current_price) * pos.amount
                 POSITION_VALUE.labels(symbol=symbol).set(pos.current_price * pos.amount)
                 await redis_client.hset("positions", symbol, pos.model_dump_json())
-                
+
                 # Publish real-time price update for instant dashboard refresh
                 if old_price != pos.current_price:
                     await redis_client.publish("position_price_update", json.dumps({
@@ -331,124 +389,83 @@ async def update_prices():
                         "unrealized_pnl": pos.unrealized_pnl,
                         "timestamp": datetime.utcnow().isoformat()
                     }))
-                
-                # TRAILING STOP-LOSS LOGIC (Profitable Strategy Enhancement)
-                # Activate trailing stop after 0.5% profit (research-backed threshold)
-                profit_pct = ((pos.current_price - pos.entry_price) / pos.entry_price) if pos.side == "long" else ((pos.entry_price - pos.current_price) / pos.entry_price)
 
-                if not pos.trailing_stop_activated and profit_pct >= 0.01:  # 1% profit threshold
-                    pos.trailing_stop_activated = True
-                    pos.highest_price = pos.current_price
-                    logger.info("✨ Trailing stop-loss ACTIVATED", symbol=symbol, profit_pct=f"{profit_pct:.2%}", current_price=pos.current_price)
+                # CIRCUIT BREAKER ONLY — emergency safety net, NOT a stop-loss
+                # This protects against catastrophic data/exchange failures
+                if pos.entry_price > 0:
+                    pnl_pct = ((pos.current_price - pos.entry_price) / pos.entry_price) if pos.side == "long" else ((pos.entry_price - pos.current_price) / pos.entry_price)
+                    if pnl_pct <= -CIRCUIT_BREAKER_PCT:
+                        logger.error("CIRCUIT BREAKER triggered — emergency exit",
+                                     symbol=symbol, pnl_pct=f"{pnl_pct:.2%}",
+                                     threshold=f"-{CIRCUIT_BREAKER_PCT:.0%}",
+                                     entry=pos.entry_price, current=pos.current_price)
+                        circuit_breaker_triggered.append(symbol)
 
-                # Update trailing stop if price moves favorably
-                if pos.trailing_stop_activated:
-                    if pos.highest_price is None:
-                        pos.highest_price = pos.current_price
+                # Update exit pressure metric for dashboard
+                pressure_state = exit_tracker.get_state(symbol)
+                AI_EXIT_PRESSURE.labels(symbol=symbol).set(pressure_state["pressure"])
 
-                    if pos.side == "long":
-                        # Update highest price for long positions
-                        if pos.current_price > pos.highest_price:
-                            pos.highest_price = pos.current_price
-                            # Trail stop-loss by 0.3% below highest price
-                            new_stop = pos.highest_price * (1 - pos.trailing_stop_distance_pct)
-                            # Only raise stop-loss, never lower it
-                            if new_stop > pos.stop_loss_price:
-                                old_stop = pos.stop_loss_price
-                                pos.stop_loss_price = new_stop
-                                logger.info("📈 Trailing stop raised", symbol=symbol, old_stop=old_stop, new_stop=pos.stop_loss_price, highest_price=pos.highest_price)
-                    else:  # short
-                        # Update lowest price for short positions
-                        if pos.current_price < pos.highest_price or pos.highest_price is None:
-                            pos.highest_price = pos.current_price  # For shorts, track lowest price
-                            # Trail stop-loss by 0.3% above lowest price
-                            new_stop = pos.highest_price * (1 + pos.trailing_stop_distance_pct)
-                            # Only lower stop-loss, never raise it
-                            if new_stop < pos.stop_loss_price:
-                                old_stop = pos.stop_loss_price
-                                pos.stop_loss_price = new_stop
-                                logger.info("📉 Trailing stop lowered", symbol=symbol, old_stop=old_stop, new_stop=pos.stop_loss_price, lowest_price=pos.highest_price)
-
-                # Check stop-loss and take-profit conditions
-                if pos.stop_loss_price and pos.take_profit_price:
-                    if pos.side == "long":
-                        if pos.current_price <= pos.stop_loss_price:
-                            trail_msg = " (TRAILING STOP)" if pos.trailing_stop_activated else ""
-                            logger.warning(f"Stop-loss triggered{trail_msg}", symbol=symbol, price=pos.current_price, stop_loss=pos.stop_loss_price)
-                            positions_to_close.append((symbol, "stop_loss"))
-                        elif pos.current_price >= pos.take_profit_price:
-                            logger.info("Take-profit triggered", symbol=symbol, price=pos.current_price, take_profit=pos.take_profit_price)
-                            positions_to_close.append((symbol, "take_profit"))
-                    else:  # short
-                        if pos.current_price >= pos.stop_loss_price:
-                            trail_msg = " (TRAILING STOP)" if pos.trailing_stop_activated else ""
-                            logger.warning(f"Stop-loss triggered{trail_msg}", symbol=symbol, price=pos.current_price, stop_loss=pos.stop_loss_price)
-                            positions_to_close.append((symbol, "stop_loss"))
-                        elif pos.current_price <= pos.take_profit_price:
-                            logger.info("Take-profit triggered", symbol=symbol, price=pos.current_price, take_profit=pos.take_profit_price)
-                            positions_to_close.append((symbol, "take_profit"))
-                
-                # Check max hold time
-                if pos.max_hold_time_minutes and pos.opened_at:
-                    try:
-                        opened_at_dt = datetime.fromisoformat(pos.opened_at.replace('Z', '+00:00'))
-                        hold_time = (datetime.utcnow() - opened_at_dt.replace(tzinfo=None)).total_seconds() / 60
-                        if hold_time >= pos.max_hold_time_minutes:
-                            logger.warning("Max hold time exceeded", symbol=symbol, hold_time_minutes=hold_time, max_minutes=pos.max_hold_time_minutes)
-                            positions_to_close.append((symbol, "max_hold_time"))
-                    except Exception as e:
-                        logger.error("Failed to check max hold time", symbol=symbol, error=str(e))
-        
-        # Close positions that triggered exit conditions
-        for symbol, reason in positions_to_close:
-            await close_position(symbol, reason)
+        # Emergency circuit breaker exits
+        for symbol in circuit_breaker_triggered:
+            CIRCUIT_BREAKER_EXITS.inc()
+            await close_position(symbol, "circuit_breaker")
 
 
 async def load_positions():
     global positions
     all_pos = await redis_client.hgetall("positions")
-    
-    # Fetch risk parameters for setting stop-loss/take-profit on existing positions
-    risk_params_str = await redis_client.get("risk_parameters")
-    if risk_params_str:
-        risk_params = json.loads(risk_params_str)
-        profit_target = risk_params.get("PROFIT_TARGET_PCT", PROFIT_TARGET_PCT)
-        max_loss = risk_params.get("MAX_TRADE_LOSS_PCT", MAX_TRADE_LOSS_PCT)
-        max_hold = risk_params.get("MAX_HOLD_TIME_MINUTES", MAX_HOLD_TIME_MINUTES)
-    else:
-        profit_target = PROFIT_TARGET_PCT
-        max_loss = MAX_TRADE_LOSS_PCT
-        max_hold = MAX_HOLD_TIME_MINUTES
-    
+
     for symbol, data in all_pos.items():
         pos_data = json.loads(data)
+        # Strip legacy fields that no longer exist on the Position model
+        for legacy_field in ("stop_loss_price", "take_profit_price", "max_hold_time_minutes",
+                             "trailing_stop_activated", "highest_price", "trailing_stop_distance_pct"):
+            pos_data.pop(legacy_field, None)
         pos = Position(**pos_data)
         if pos.status == "open":
-            # If position doesn't have stop-loss/take-profit set, add them now
-            if pos.stop_loss_price is None or pos.take_profit_price is None:
-                if pos.side == "long":
-                    pos.stop_loss_price = pos.entry_price * (1 - max_loss)
-                    pos.take_profit_price = pos.entry_price * (1 + profit_target)
-                else:  # short
-                    pos.stop_loss_price = pos.entry_price * (1 + max_loss)
-                    pos.take_profit_price = pos.entry_price * (1 - profit_target)
-            
-            if pos.max_hold_time_minutes is None:
-                pos.max_hold_time_minutes = max_hold
-            
-            # Save updated position back to Redis
             await redis_client.hset("positions", symbol, pos.model_dump_json())
             positions[symbol] = pos
-            logger.info("Position loaded with stop-loss/take-profit", symbol=symbol, 
-                       stop_loss=pos.stop_loss_price, take_profit=pos.take_profit_price, 
-                       max_hold_minutes=pos.max_hold_time_minutes, entry_price=pos.entry_price)
+            exit_tracker.reset(symbol)  # Fresh pressure tracking
+            logger.info("Position loaded (AI-exit mode)", symbol=symbol, entry_price=pos.entry_price)
+
+
+async def _get_regime_for_symbol(symbol: str) -> Optional[RegimeState]:
+    """Read regime state from Redis (published by signal service)."""
+    try:
+        regime_data = await redis_client.hget("regime_state", symbol)
+        if regime_data:
+            data = json.loads(regime_data)
+            return RegimeState(
+                regime=data.get("regime", "choppy"),
+                trend_strength=float(data.get("trend_strength", 0)),
+                volatility_ratio=float(data.get("volatility_ratio", 1.0)),
+                choppiness=float(data.get("choppiness", 0.5)),
+                confidence=float(data.get("confidence", 0.5)),
+                details=data.get("details", {}),
+            )
+    except Exception as e:
+        logger.warning("Failed to read regime state", symbol=symbol, error=str(e))
+    return None
 
 
 async def listen_for_prediction_exits():
-    """AI-driven exits: listen to predictions and close positions when model says sell."""
+    """AI-driven exits with adaptive regime-aware thresholds.
+
+    v2.0: Exit pressure thresholds adapt to market regime and volatility:
+    - Reads regime state from Redis (published by signal service every 5s)
+    - Computes adaptive exit params via compute_adaptive_exit_params()
+    - Trending: harder to exit (threshold×1.4, need 3 consecutive sells)
+    - Choppy: easier to exit (threshold×0.7, sell signals weighted 1.3×)
+    - High vol: easiest to exit (threshold×0.6, sell signals weighted 1.5×)
+    - Volatility risk floor: if loss > 3×ATR, urgency increases
+
+    Falls back to fixed defaults if regime state is unavailable.
+    """
     pubsub = redis_client.pubsub()
     await pubsub.psubscribe("predictions:*")
-    logger.info("AI exit listener subscribed to predictions:*")
+    logger.info("AI exit listener subscribed to predictions:* (adaptive pressure v2.0)",
+                base_threshold=EXIT_PRESSURE_THRESHOLD,
+                base_min_sells=MIN_SELL_SIGNALS_BEFORE_EXIT)
 
     async for message in pubsub.listen():
         if message["type"] != "pmessage":
@@ -459,43 +476,141 @@ async def listen_for_prediction_exits():
             direction = prediction.get("direction", "hold")
             confidence = float(prediction.get("confidence", 0))
 
-            # Only act on sell/strong_sell for symbols we hold
-            if direction not in ("sell", "strong_sell"):
-                continue
+            # Only process predictions for symbols we hold
             if symbol not in positions or positions[symbol].status != "open":
                 continue
             if confidence < AI_EXIT_CONFIDENCE:
                 continue
 
             pos = positions[symbol]
-            # Calculate current P&L
+
+            # Calculate current P&L percentage
             if pos.entry_price > 0:
-                pnl_pct = (pos.current_price - pos.entry_price) / pos.entry_price if pos.side == "long" else (pos.entry_price - pos.current_price) / pos.entry_price
+                pnl_pct = ((pos.current_price - pos.entry_price) / pos.entry_price
+                           if pos.side == "long"
+                           else (pos.entry_price - pos.current_price) / pos.entry_price)
             else:
                 pnl_pct = 0
 
-            # AI exit decision: close if model is confident about reversal
-            # Stronger sell signals need less P&L confirmation
-            should_exit = False
-            reason = ""
+            # Calculate hold time
+            try:
+                opened_at = datetime.fromisoformat(pos.opened_at.replace('Z', '+00:00').replace('+00:00', ''))
+                hold_time_minutes = (datetime.utcnow() - opened_at).total_seconds() / 60
+            except Exception:
+                hold_time_minutes = 0
 
-            if direction == "strong_sell" and confidence >= 0.6:
-                should_exit = True
-                reason = "ai_strong_sell"
-            elif direction == "strong_sell" and confidence >= 0.3 and pnl_pct < 0:
-                should_exit = True
-                reason = "ai_strong_sell_losing"
-            elif direction == "sell" and confidence >= 0.3 and pnl_pct < -0.005:
-                should_exit = True
-                reason = "ai_sell_losing"
-            elif direction == "sell" and confidence >= 0.5 and pnl_pct > 0.005:
-                should_exit = True
-                reason = "ai_sell_take_profit"
+            # Get regime state from Redis (published by signal service)
+            regime = await _get_regime_for_symbol(symbol)
+
+            # Get ATR from features (for volatility risk floor)
+            atr_pct = 0.5  # default
+            try:
+                features_data = await redis_client.get(f"features:{symbol}")
+                if features_data:
+                    features = json.loads(features_data)
+                    atr_pct = float(features.get("atr_pct", 0.5))
+            except Exception:
+                pass
+
+            # Compute adaptive exit parameters
+            if regime:
+                adaptive = compute_adaptive_exit_params(
+                    regime=regime,
+                    pnl_pct=pnl_pct,
+                    atr_pct=atr_pct,
+                    hold_time_minutes=hold_time_minutes,
+                )
+                p_threshold = adaptive.pressure_threshold
+                p_min_consec = adaptive.min_consecutive_sells
+                p_decay = adaptive.decay_rate
+                p_sell_w = adaptive.sell_weight
+                p_strong_sell_w = adaptive.strong_sell_weight
+                p_vol_urgency = adaptive.vol_urgency
+                regime_name = adaptive.regime
+            else:
+                # Fallback to fixed defaults if no regime data
+                p_threshold = EXIT_PRESSURE_THRESHOLD
+                p_min_consec = MIN_SELL_SIGNALS_BEFORE_EXIT
+                p_decay = EXIT_PRESSURE_DECAY
+                p_sell_w = 0.6
+                p_strong_sell_w = 1.0
+                p_vol_urgency = 0.0
+                regime_name = "unknown"
+
+            # Feed every prediction into the adaptive exit pressure tracker
+            pressure, should_exit = exit_tracker.update(
+                symbol=symbol, direction=direction, confidence=confidence,
+                pnl_pct=pnl_pct,
+                sell_weight=p_sell_w, strong_sell_weight=p_strong_sell_w,
+                decay_rate=p_decay, pressure_threshold=p_threshold,
+                min_consecutive_sells=p_min_consec, vol_urgency=p_vol_urgency,
+            )
+
+            if direction in ("sell", "strong_sell"):
+                state = exit_tracker.get_state(symbol)
+                logger.info("AI exit pressure update (adaptive)",
+                            symbol=symbol, direction=direction, confidence=f"{confidence:.2f}",
+                            pnl_pct=f"{pnl_pct:.4%}", pressure=f"{pressure:.3f}",
+                            consecutive_sells=state["consecutive_sells"],
+                            threshold=f"{p_threshold:.3f}",
+                            regime=regime_name, vol_urgency=f"{p_vol_urgency:.3f}",
+                            should_exit=should_exit)
 
             if should_exit:
-                logger.info("AI prediction-driven exit",
-                            symbol=symbol, direction=direction, confidence=confidence,
-                            pnl_pct=f"{pnl_pct:.4%}", reason=reason)
+                # Determine specific exit reason for analytics
+                state = exit_tracker.get_state(symbol)
+                if direction == "strong_sell" and confidence >= 0.6:
+                    reason = "ai_strong_sell"
+                elif pnl_pct < -0.01:
+                    reason = "ai_sell_cut_loss"
+                elif pnl_pct > 0.005:
+                    reason = "ai_sell_take_profit"
+                else:
+                    reason = "ai_sell_reversal"
+
+                # Build explainable exit record
+                if regime:
+                    exit_explanation = explain_exit(
+                        should_exit=True, reason=reason, pressure=pressure,
+                        params=adaptive, consecutive_sells=state["consecutive_sells"],
+                        pnl_pct=pnl_pct, atr_pct=atr_pct, confidence=confidence,
+                        direction=direction, hold_time_minutes=hold_time_minutes,
+                    )
+                    logger.info("AI EXIT TRIGGERED — adaptive threshold reached",
+                                symbol=symbol, reason=reason, pressure=f"{pressure:.3f}",
+                                consecutive_sells=state["consecutive_sells"],
+                                pnl_pct=f"{pnl_pct:.4%}", confidence=f"{confidence:.2f}",
+                                regime=regime_name, threshold=f"{p_threshold:.3f}",
+                                vol_urgency=f"{p_vol_urgency:.3f}",
+                                hold_minutes=f"{hold_time_minutes:.1f}",
+                                last_directions=state["last_directions"][-5:])
+
+                    # Store exit explanation in Redis for dashboard/analysis
+                    await redis_client.lpush("exit_explanations", json.dumps({
+                        "symbol": symbol,
+                        "reason": exit_explanation.reason,
+                        "pressure": exit_explanation.pressure,
+                        "threshold": exit_explanation.threshold,
+                        "consecutive_sells": exit_explanation.consecutive_sells,
+                        "pnl_pct": exit_explanation.pnl_pct,
+                        "regime": exit_explanation.regime,
+                        "atr_pct": exit_explanation.atr_pct,
+                        "vol_urgency": exit_explanation.vol_urgency,
+                        "confidence": exit_explanation.confidence,
+                        "direction": exit_explanation.direction,
+                        "hold_time_minutes": exit_explanation.hold_time_minutes,
+                        "timestamp": datetime.utcnow().isoformat(),
+                    }))
+                    await redis_client.ltrim("exit_explanations", 0, 499)
+                else:
+                    logger.info("AI EXIT TRIGGERED — fixed threshold (no regime data)",
+                                symbol=symbol, reason=reason, pressure=f"{pressure:.3f}",
+                                consecutive_sells=state["consecutive_sells"],
+                                pnl_pct=f"{pnl_pct:.4%}", confidence=f"{confidence:.2f}",
+                                last_directions=state["last_directions"][-5:])
+
+                AI_EXITS_TOTAL.labels(reason=reason).inc()
+                exit_tracker.reset(symbol)
                 await close_position(symbol, reason)
 
         except Exception as e:
@@ -509,32 +624,11 @@ async def lifespan(app: FastAPI):
 
     redis_client = aioredis.Redis(host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASSWORD, decode_responses=True)
     await load_positions()
-    
-    # Ensure all loaded positions have stop-loss/take-profit set
-    risk_params_str = await redis_client.get("risk_parameters")
-    if risk_params_str:
-        risk_params = json.loads(risk_params_str)
-        profit_target = risk_params.get("PROFIT_TARGET_PCT", PROFIT_TARGET_PCT)
-        max_loss = risk_params.get("MAX_TRADE_LOSS_PCT", MAX_TRADE_LOSS_PCT)
-        max_hold = risk_params.get("MAX_HOLD_TIME_MINUTES", MAX_HOLD_TIME_MINUTES)
-    else:
-        profit_target = PROFIT_TARGET_PCT
-        max_loss = MAX_TRADE_LOSS_PCT
-        max_hold = MAX_HOLD_TIME_MINUTES
-    
-    for symbol, pos in positions.items():
-        if pos.status == "open" and (pos.stop_loss_price is None or pos.take_profit_price is None):
-            if pos.side == "long":
-                pos.stop_loss_price = pos.entry_price * (1 - max_loss)
-                pos.take_profit_price = pos.entry_price * (1 + profit_target)
-            else:
-                pos.stop_loss_price = pos.entry_price * (1 + max_loss)
-                pos.take_profit_price = pos.entry_price * (1 - profit_target)
-            if pos.max_hold_time_minutes is None:
-                pos.max_hold_time_minutes = max_hold
-            await redis_client.hset("positions", symbol, pos.model_dump_json(exclude_none=False))
-            logger.warning("Updated existing position with stop-loss/take-profit on startup", symbol=symbol,
-                         stop_loss=pos.stop_loss_price, take_profit=pos.take_profit_price)
+    logger.info("Positions loaded — AI-only exit mode active",
+                open_positions=len([p for p in positions.values() if p.status == "open"]),
+                circuit_breaker=f"-{CIRCUIT_BREAKER_PCT:.0%}",
+                exit_pressure_threshold=EXIT_PRESSURE_THRESHOLD,
+                min_sell_signals=MIN_SELL_SIGNALS_BEFORE_EXIT)
 
     order_task = asyncio.create_task(listen_for_orders())
     price_task = asyncio.create_task(update_prices())
@@ -554,7 +648,13 @@ app = FastAPI(title="Position Manager", version="1.0.0", lifespan=lifespan)
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "positions": len([p for p in positions.values() if p.status == "open"])}
+    return {
+        "status": "healthy",
+        "positions": len([p for p in positions.values() if p.status == "open"]),
+        "exit_mode": "adaptive_regime_pressure_v2",
+        "circuit_breaker": f"-{CIRCUIT_BREAKER_PCT:.0%}",
+        "base_pressure_threshold": EXIT_PRESSURE_THRESHOLD,
+    }
 
 
 @app.get("/positions")
@@ -581,7 +681,7 @@ async def get_total_pnl():
 
 @app.get("/position-health")
 async def get_position_health():
-    """Check for stuck or problematic positions"""
+    """Check position health with AI exit pressure state"""
     health_report = []
     current_time = datetime.utcnow()
 
@@ -594,28 +694,60 @@ async def get_position_health():
             health_status = "healthy"
             issues = []
 
-            if age_minutes > 5:
-                health_status = "stuck"
-                issues.append(f"Position open for {age_minutes:.1f} minutes")
-
-            if pnl_pct < -2:
+            if pnl_pct < -CIRCUIT_BREAKER_PCT * 100 * 0.7:  # Approaching circuit breaker
+                health_status = "warning"
+                issues.append(f"Approaching circuit breaker: {pnl_pct:.2f}%")
+            elif pnl_pct < -5:
                 health_status = "loss"
-                issues.append(f"Large loss: {pnl_pct:.2f}%")
+                issues.append(f"Significant loss: {pnl_pct:.2f}%")
 
             if pnl_pct > 1:
-                issues.append(f"Profit opportunity: {pnl_pct:.2f}%")
+                issues.append(f"Profit: {pnl_pct:.2f}%")
+
+            pressure_state = exit_tracker.get_state(symbol)
 
             health_report.append({
                 "symbol": symbol,
                 "status": health_status,
-                "age_minutes": age_minutes,
-                "pnl_percent": pnl_pct,
+                "age_minutes": round(age_minutes, 1),
+                "pnl_percent": round(pnl_pct, 4),
                 "issues": issues,
                 "entry_price": pos.entry_price,
-                "current_price": pos.current_price
+                "current_price": pos.current_price,
+                "ai_exit_pressure": pressure_state,
             })
 
     return {"positions": health_report, "total_positions": len(health_report)}
+
+
+@app.get("/exit-pressure")
+async def get_exit_pressure():
+    """Debug endpoint: view AI exit pressure for all open positions"""
+    result = {}
+    for symbol, pos in positions.items():
+        if pos.status == "open":
+            pnl_pct = ((pos.current_price - pos.entry_price) / pos.entry_price
+                       if pos.side == "long"
+                       else (pos.entry_price - pos.current_price) / pos.entry_price) if pos.entry_price > 0 else 0
+            result[symbol] = {
+                **exit_tracker.get_state(symbol),
+                "pnl_pct": round(pnl_pct, 6),
+                "side": pos.side,
+                "entry_price": pos.entry_price,
+                "current_price": pos.current_price,
+            }
+    return result
+
+
+@app.get("/exit-explanations")
+async def get_exit_explanations(limit: int = 20):
+    """Get recent exit explanations with full context (regime, vol, pressure)."""
+    try:
+        explanations = await redis_client.lrange("exit_explanations", 0, limit - 1)
+        return {"explanations": [json.loads(e) for e in explanations], "total": len(explanations)}
+    except Exception as e:
+        logger.error("Failed to get exit explanations", error=str(e))
+        return {"explanations": [], "total": 0}
 
 
 @app.get("/trades")

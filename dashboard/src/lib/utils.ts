@@ -89,3 +89,34 @@ export function formatLargeNumber(n: number): string {
   if (n >= 1e6) return `$${(n / 1e6).toFixed(2)}M`;
   return `$${n.toLocaleString()}`;
 }
+
+/**
+ * Compute max drawdown from a chronologically sorted list of trades.
+ * Walks cumulative equity (startingCapital + running sum of realized_pnl),
+ * tracks peak, and returns the deepest (equity - peak) / peak * 100.
+ */
+export function computeMaxDrawdown(
+  trades: Array<{ realized_pnl: number; closed_at: string }>,
+  startingCapital: number,
+): number {
+  if (!trades || trades.length === 0) return 0;
+
+  const sorted = [...trades].sort(
+    (a, b) => new Date(a.closed_at).getTime() - new Date(b.closed_at).getTime(),
+  );
+
+  let equity = startingCapital;
+  let peak = equity;
+  let maxDd = 0;
+
+  for (const t of sorted) {
+    equity += t.realized_pnl;
+    if (equity > peak) peak = equity;
+    if (peak > 0) {
+      const dd = ((equity - peak) / peak) * 100;
+      if (dd < maxDd) maxDd = dd;
+    }
+  }
+
+  return maxDd;
+}

@@ -79,16 +79,16 @@ export default function PositionOrbit({ position, orbitRadius, orbitSpeed, index
                   ${position.unrealized_pnl.toFixed(2)}
                 </span>
               </div>
-              {position.stop_loss_price > 0 && (
+              {(position.stop_loss_price ?? 0) > 0 && (
                 <div className="flex justify-between">
                   <span>Stop Loss</span>
-                  <span className="text-red-400">${position.stop_loss_price.toLocaleString()}</span>
+                  <span className="text-red-400">${position.stop_loss_price!.toLocaleString()}</span>
                 </div>
               )}
-              {position.take_profit_price > 0 && (
+              {(position.take_profit_price ?? 0) > 0 && (
                 <div className="flex justify-between">
                   <span>Take Profit</span>
-                  <span className="text-green-400">${position.take_profit_price.toLocaleString()}</span>
+                  <span className="text-green-400">${position.take_profit_price!.toLocaleString()}</span>
                 </div>
               )}
             </div>

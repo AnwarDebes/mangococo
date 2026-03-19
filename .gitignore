@@ -8,8 +8,8 @@
 # Never commit these files!
 .env
 config/.env
-config/.env.example
-*.env.example
+# Keep example env templates tracked (but not real env files)
+!config/trading.env.example
 *.env.local
 *.env.production
 *secret*

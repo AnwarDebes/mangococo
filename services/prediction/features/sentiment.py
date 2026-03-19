@@ -24,9 +24,21 @@ SENTIMENT_KEYS = [
     "fear_greed_index",
 ]
 
+# Module-level shared HTTP client — avoids creating a new TCP connection per call.
+_http_client: Optional[httpx.AsyncClient] = None
+
+
+def _get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(timeout=2.0)
+    return _http_client
+
 
 def _defaults() -> Dict[str, float]:
-    return {k: 0.0 for k in SENTIMENT_KEYS}
+    d = {k: 0.0 for k in SENTIMENT_KEYS}
+    d["_source"] = "default"
+    return d
 
 
 async def fetch_sentiment_features(
@@ -43,28 +55,28 @@ async def fetch_sentiment_features(
     3. Return zeros on failure.
     """
     url = feature_store_url or FEATURE_STORE_URL
+    client = _get_http_client()
 
-    # Attempt 1: feature-store HTTP (with retry)
-    for attempt in range(2):
-        try:
-            async with httpx.AsyncClient(timeout=3.0) as client:
-                resp = await client.get(f"{url}/features/{symbol}")
-                if resp.status_code == 200:
-                    data = resp.json()
-                    return {k: float(data.get(k, 0.0)) for k in SENTIMENT_KEYS}
-        except Exception:
-            if attempt == 0:
-                import asyncio
-                await asyncio.sleep(0.5)
+    # Attempt 1: feature-store HTTP (single attempt, short timeout)
+    try:
+        resp = await client.get(f"{url}/features/{symbol}")
+        if resp.status_code == 200:
+            data = resp.json()
+            result = {k: float(data.get(k, 0.0)) for k in SENTIMENT_KEYS}
+            result["_source"] = "feature_store"
+            return result
+    except Exception:
+        pass
 
     # Attempt 2: Redis
     if redis_client is not None:
         try:
             raw = await redis_client.hgetall(f"sentiment:{symbol}")
             if raw:
-                return {k: float(raw.get(k, 0.0)) for k in SENTIMENT_KEYS}
+                result = {k: float(raw.get(k, 0.0)) for k in SENTIMENT_KEYS}
+                result["_source"] = "redis"
+                return result
         except Exception:
             pass
 
-    logger.debug("Sentiment features unavailable, returning defaults", symbol=symbol)
     return _defaults()

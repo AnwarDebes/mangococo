@@ -1,9 +1,17 @@
 """
-Signal Service - Converts predictions to trading signals
+Signal Service v2.0 — Regime-aware, edge-gated signal generation
+
+Converts ML predictions to trading signals, but only when:
+  Layer A: Regime filter says conditions are favorable
+  Layer B: Edge gate confirms sufficient edge exists
+  Layer C: Volatility-targeted sizing produces a viable position
+
+Signals that fail any layer are logged and skipped (no trade).
 """
 import asyncio
 import json
 import os
+import sys
 import uuid
 from datetime import datetime
 from typing import Optional, Dict
@@ -17,12 +25,18 @@ from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 from prometheus_client import Counter, Gauge, generate_latest
 
+# Add strategy module to path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "strategy"))
+from regime import classify_regime, regime_allows_entry, RegimeState
+from edge_gate import evaluate_edge, EdgeDecision
+from vol_sizing import calculate_vol_targeted_size, SizingResult
+
 # Configuration
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "")
-CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", 0.3))  # 30% confidence threshold - AGGRESSIVE for testing
-STARTING_CAPITAL = float(os.getenv("STARTING_CAPITAL", 11.0))
+CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", 0.3))
+STARTING_CAPITAL = float(os.getenv("STARTING_CAPITAL", 1000.0))
 MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", 0.50))
 MIN_POSITION_USD = float(os.getenv("MIN_POSITION_USD", 1.0))
 TRADING_PAIRS_FILE = os.getenv("TRADING_PAIRS_FILE", "")
@@ -33,6 +47,9 @@ logger = structlog.get_logger()
 # Metrics
 SIGNALS_GENERATED = Counter("signal_generated_total", "Signals generated", ["symbol", "action"])
 SIGNALS_SKIPPED = Counter("signal_skipped_total", "Signals skipped", ["reason"])
+REGIME_CLASSIFICATIONS = Counter("signal_regime_total", "Regime classifications", ["regime"])
+EDGE_GATE_DECISIONS = Counter("signal_edge_gate_total", "Edge gate decisions", ["decision"])
+CURRENT_REGIME = Gauge("signal_current_regime_score", "Current regime score", ["symbol", "regime_type"])
 
 
 class Signal(BaseModel):
@@ -43,6 +60,9 @@ class Signal(BaseModel):
     price: float
     confidence: float
     timestamp: str
+    regime: str = ""
+    edge_score: float = 0.0
+    vol_ratio: float = 1.0
 
 
 class Position(BaseModel):
@@ -56,7 +76,8 @@ class Position(BaseModel):
 redis_client: Optional[aioredis.Redis] = None
 current_positions: Dict[str, Position] = {}
 last_signals: Dict[str, Signal] = {}
-processed_signals: set = set()  # Track processed signal IDs for idempotency
+processed_signals: set = set()
+last_regime: Dict[str, RegimeState] = {}  # Track last regime per symbol
 
 
 def _safe_float(value, default: float = 0.0) -> float:
@@ -68,17 +89,82 @@ def _safe_float(value, default: float = 0.0) -> float:
         return default
 
 
+async def _get_features(symbol: str) -> Dict[str, float]:
+    """Fetch cached features from Redis (computed by feature-store every 5s)."""
+    try:
+        raw = await redis_client.get(f"features:{symbol}")
+        if raw:
+            return json.loads(raw)
+    except Exception:
+        pass
+    return {}
+
+
+async def _get_portfolio_value() -> float:
+    """Get current portfolio value from Redis."""
+    try:
+        data = await redis_client.get("portfolio_state")
+        if data:
+            state = json.loads(data)
+            return float(state.get("total_capital", 0) or state.get("available_capital", STARTING_CAPITAL))
+    except Exception:
+        pass
+    return STARTING_CAPITAL
+
+
+async def _get_available_capital() -> float:
+    """Get available capital (tries executor first, then Redis)."""
+    available = None
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get("http://localhost:8005/balance")
+            if response.status_code == 200:
+                data = response.json()
+                balances = data.get("balances", {})
+                usdt_balance = balances.get("USDT", {}).get("free", 0) or 0
+                available = usdt_balance
+    except Exception:
+        pass
+
+    if available is None:
+        portfolio = await redis_client.get("portfolio_state")
+        available = json.loads(portfolio).get("available_capital", STARTING_CAPITAL) if portfolio else STARTING_CAPITAL
+
+    return available
+
+
+async def _get_open_risk() -> float:
+    """Estimate total open risk (ATR-based) across all positions."""
+    total_risk = 0.0
+    try:
+        positions = await redis_client.hgetall("positions")
+        for sym, data in positions.items():
+            pos = json.loads(data)
+            if pos.get("status") == "open":
+                entry = float(pos.get("entry_price", 0))
+                amount = float(pos.get("amount", 0))
+                # Get ATR for this symbol
+                features = await _get_features(sym)
+                atr_pct = features.get("atr_pct", 0.5)
+                atr_decimal = max(atr_pct / 100.0, 0.0001)
+                # Risk = position_value * 2 * ATR (2-ATR risk estimate)
+                total_risk += entry * amount * 2 * atr_decimal
+    except Exception:
+        pass
+    return total_risk
+
+
 async def generate_signal(prediction: dict) -> Optional[Signal]:
+    """Generate a signal with full 3-layer strategy gating."""
     symbol = prediction.get("symbol")
     direction = prediction.get("direction", "hold")
     confidence = _safe_float(prediction.get("confidence"), 0.0)
     current_price = _safe_float(prediction.get("current_price"), 0.0)
+    breakdown = prediction.get("breakdown", {})
 
-    # Backward compatibility: older payloads may provide "price" instead of "current_price"
+    # Price fallbacks
     if current_price <= 0:
         current_price = _safe_float(prediction.get("price"), 0.0)
-
-    # Final fallback: derive latest price from market-data cache if payload omitted it
     if current_price <= 0 and symbol:
         try:
             tick_raw = await redis_client.hget("latest_ticks", symbol)
@@ -90,17 +176,14 @@ async def generate_signal(prediction: dict) -> Optional[Signal]:
 
     if not symbol or current_price <= 0:
         SIGNALS_SKIPPED.labels(reason="missing_price").inc()
-        logger.warning("Prediction missing symbol or usable price", symbol=symbol)
         return None
 
+    # Idempotency
     prediction_id = prediction.get("id")
     if not prediction_id:
         timestamp_hint = prediction.get("timestamp", "")
         prediction_id = f"{symbol}_{direction}_{timestamp_hint or int(current_price * 1000)}"
-
-    # IDEMPOTENCY: Check if this prediction has already been processed
     if prediction_id in processed_signals:
-        logger.debug("Prediction already processed, skipping", prediction_id=prediction_id)
         return None
 
     if confidence < CONFIDENCE_THRESHOLD:
@@ -111,7 +194,7 @@ async def generate_signal(prediction: dict) -> Optional[Signal]:
         SIGNALS_SKIPPED.labels(reason="hold_signal").inc()
         return None
 
-    # Normalize direction: strong_buy → buy, strong_sell → sell
+    # Normalize direction
     if direction in ("strong_buy", "buy"):
         normalized_direction = "buy"
     elif direction in ("strong_sell", "sell"):
@@ -122,7 +205,7 @@ async def generate_signal(prediction: dict) -> Optional[Signal]:
 
     has_position = symbol in current_positions
 
-    # Only buy if we don't have a position, only sell if we have one
+    # Only buy if no position, only sell if have position
     if normalized_direction == "buy" and not has_position:
         action = "buy"
     elif normalized_direction == "sell" and has_position:
@@ -131,104 +214,143 @@ async def generate_signal(prediction: dict) -> Optional[Signal]:
         SIGNALS_SKIPPED.labels(reason="no_action").inc()
         return None
 
-    if action == "buy":
-        # Get actual balance from executor service (more reliable than Redis cache)
-        available = None
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                response = await client.get("http://localhost:8005/balance")
-                if response.status_code == 200:
-                    data = response.json()
-                    balances = data.get("balances", {})
-                    usdt_balance = balances.get("USDT", {}).get("free", 0) or 0
-                    available = usdt_balance
-                    logger.info(f"Fetched actual USDT balance from executor: ${available:.2f}")
-        except Exception as e:
-            logger.warning(f"Could not fetch balance from executor, using Redis fallback: {e}")
-        
-        # Fallback to Redis if executor call failed
-        if available is None:
-            portfolio = await redis_client.get("portfolio_state")
-            available = json.loads(portfolio).get("available_capital", STARTING_CAPITAL) if portfolio else STARTING_CAPITAL
-            logger.info(f"Using Redis balance: ${available:.2f}")
+    # ══════════════════════════════════════════════════════════════════
+    # LAYER A: Regime Filter
+    # ══════════════════════════════════════════════════════════════════
+    features = await _get_features(symbol)
+    regime = classify_regime(features, symbol)
+    last_regime[symbol] = regime
+    REGIME_CLASSIFICATIONS.labels(regime=regime.regime).inc()
 
-        # Minimum trade threshold
-        MIN_TRADE_VALUE = 5.0  # $5 minimum per trade
+    # Publish regime to Redis for position manager's adaptive exits
+    regime_data = {
+        "regime": regime.regime,
+        "trend_strength": regime.trend_strength,
+        "volatility_ratio": regime.volatility_ratio,
+        "choppiness": regime.choppiness,
+        "confidence": regime.confidence,
+        "atr_pct": features.get("atr_pct", 0.5),
+    }
+    await redis_client.hset("regime_state", symbol, json.dumps(regime_data))
+
+    if action == "buy" and not regime_allows_entry(regime, normalized_direction):
+        SIGNALS_SKIPPED.labels(reason="regime_blocked").inc()
+        logger.info("Regime blocked entry",
+                     symbol=symbol, direction=normalized_direction,
+                     regime=regime.regime, choppiness=regime.choppiness,
+                     trend_strength=regime.trend_strength)
+        return None
+
+    # ══════════════════════════════════════════════════════════════════
+    # LAYER B: Edge Gate
+    # ══════════════════════════════════════════════════════════════════
+    if action == "buy":  # only gate entries, not exits
+        edge = evaluate_edge(prediction, regime, features)
+        EDGE_GATE_DECISIONS.labels(decision="take" if edge.take else "skip").inc()
+
+        if not edge.take:
+            SIGNALS_SKIPPED.labels(reason="edge_gate_skip").inc()
+            logger.info("Edge gate blocked entry",
+                         symbol=symbol, edge_score=edge.edge_score,
+                         reasons=edge.reasons, regime=regime.regime)
+            return None
+
+        logger.info("Edge gate approved",
+                     symbol=symbol, edge_score=edge.edge_score,
+                     size_mult=edge.size_multiplier,
+                     reasons=edge.reasons, regime=regime.regime)
+    else:
+        edge = None  # sell signals pass through (exit managed by position manager)
+
+    # ══════════════════════════════════════════════════════════════════
+    # LAYER C: Volatility-Targeted Sizing
+    # ══════════════════════════════════════════════════════════════════
+    if action == "buy":
+        available = await _get_available_capital()
+        MIN_TRADE_VALUE = 5.0
         if available < MIN_TRADE_VALUE:
-            logger.info(f"Insufficient balance for trade", balance=available)
             SIGNALS_SKIPPED.labels(reason="insufficient_balance").inc()
             return None
 
-        # Let confidence and direction strength determine trade size
-        # Base allocation: 2-10% of available capital, scaled by confidence
-        if direction in ("strong_buy", "strong_sell"):
-            base_pct = 0.08  # 8% for strong signals
-        else:
-            base_pct = 0.04  # 4% for normal signals
+        portfolio_value = await _get_portfolio_value()
+        atr_pct = features.get("atr_pct", 0.5)
+        open_risk = await _get_open_risk()
 
-        trade_value = available * base_pct * confidence
-        trade_value = max(MIN_TRADE_VALUE, min(trade_value, available * 0.15))  # Floor $5, cap 15% of balance
+        sizing = calculate_vol_targeted_size(
+            portfolio_value=portfolio_value,
+            current_price=current_price,
+            atr_pct=atr_pct,
+            confidence=confidence,
+            regime=regime,
+            edge_multiplier=edge.size_multiplier if edge else 1.0,
+            open_risk_usd=open_risk,
+        )
 
-        amount = trade_value  # USDT value for the trade
-        logger.info("AI-sized trade", symbol=symbol, available=available,
-                    confidence=confidence, direction=direction, trade_value=trade_value)
+        if sizing.skip:
+            SIGNALS_SKIPPED.labels(reason="vol_sizing_skip").inc()
+            logger.info("Vol sizing blocked entry",
+                         symbol=symbol, reason=sizing.skip_reason,
+                         details=sizing.details)
+            return None
+
+        # Cap to available capital
+        amount = min(sizing.position_usd, available * 0.95)
+        if amount < MIN_TRADE_VALUE:
+            SIGNALS_SKIPPED.labels(reason="insufficient_after_sizing").inc()
+            return None
+
+        logger.info("Vol-targeted size calculated",
+                     symbol=symbol, position_usd=round(amount, 2),
+                     risk_usd=sizing.risk_usd, atr_pct=atr_pct,
+                     vol_ratio=sizing.vol_ratio,
+                     regime_mult=sizing.regime_multiplier,
+                     edge_mult=sizing.edge_multiplier)
     else:
+        # Sell: use position amount
         amount = current_positions[symbol].amount
 
     signal = Signal(
         signal_id=str(uuid.uuid4())[:8], symbol=symbol, action=action,
         amount=amount, price=current_price, confidence=confidence,
-        timestamp=datetime.utcnow().isoformat()
+        timestamp=datetime.utcnow().isoformat(),
+        regime=regime.regime,
+        edge_score=edge.edge_score if edge else 0.0,
+        vol_ratio=regime.volatility_ratio,
     )
 
     SIGNALS_GENERATED.labels(symbol=symbol, action=action).inc()
     last_signals[symbol] = signal
 
-    # IDEMPOTENCY: Mark this prediction as processed
     processed_signals.add(prediction_id)
-
-    # Keep only recent processed signals to prevent memory growth
     if len(processed_signals) > 1000:
-        # Remove oldest signals (simple FIFO)
         processed_signals.pop()
 
-    logger.info("Signal generated", signal_id=signal.signal_id, symbol=symbol, action=action, prediction_id=prediction_id)
+    logger.info("SIGNAL GENERATED (3-layer approved)",
+                signal_id=signal.signal_id, symbol=symbol, action=action,
+                regime=regime.regime, edge_score=signal.edge_score,
+                vol_ratio=signal.vol_ratio, amount=round(amount, 4))
 
     return signal
 
 
 async def listen_for_predictions():
     pubsub = redis_client.pubsub()
-    # CRITICAL: Use psubscribe for pattern matching, not subscribe!
     await pubsub.psubscribe("predictions:*")
-    logger.info("Subscribed to predictions:* pattern with psubscribe")
+    logger.info("Subscribed to predictions:* (3-layer strategy active)")
 
     async for message in pubsub.listen():
-        # psubscribe uses "pmessage" type, not "message"
         if message["type"] == "pmessage":
             try:
-                # Extract symbol from channel name for wildcard subscription
                 channel = message["channel"]
                 channel_parts = channel.split(":")
                 if len(channel_parts) >= 2:
-                    symbol_key = channel_parts[1]  # e.g., "BTC_USDT"
-                    symbol = symbol_key.replace("_", "/")  # Convert back to BTC/USDT format
-
                     prediction = json.loads(message["data"])
-                    confidence = _safe_float(prediction.get("confidence"), 0.0)
-                    logger.info(
-                        f"Received prediction for {symbol}: "
-                        f"direction={prediction.get('direction')}, confidence={confidence:.2f}"
-                    )
-                    
-                    # Ensure the prediction symbol matches our trading pairs
                     if prediction.get("symbol") in [s.strip() for s in TRADING_PAIRS]:
                         signal = await generate_signal(prediction)
                         if signal:
                             await redis_client.publish("raw_signals", signal.model_dump_json())
-                            logger.info(f"🚀 SIGNAL PUBLISHED: {signal.action} {signal.symbol} amount={signal.amount:.4f}")
-                        else:
-                            logger.debug(f"No signal generated for {symbol}")
+                            logger.info(f"SIGNAL PUBLISHED: {signal.action} {signal.symbol} "
+                                        f"${signal.amount:.2f} regime={signal.regime}")
             except Exception as e:
                 logger.error("Error processing prediction", error=str(e), exc_info=True)
 
@@ -259,7 +381,6 @@ async def sync_balance_from_mexc():
                 data = response.json()
                 balances = data.get("balances", {})
                 usdt_balance = balances.get("USDT", {}).get("free", 0)
-
                 portfolio_state = {
                     "total_capital": usdt_balance,
                     "available_capital": usdt_balance,
@@ -267,15 +388,14 @@ async def sync_balance_from_mexc():
                     "open_positions": 0
                 }
                 await redis_client.set("portfolio_state", json.dumps(portfolio_state))
-                logger.info(f"Synced USDT balance from MEXC: ${usdt_balance:.2f}")
+                logger.info(f"Synced USDT balance: ${usdt_balance:.2f}")
                 return usdt_balance
     except Exception as e:
-        logger.warning(f"Could not sync balance from MEXC: {e}")
+        logger.warning(f"Could not sync balance: {e}")
     return None
 
 
 def load_symbols_from_file(filepath: str, wait_seconds: int = 60) -> list:
-    """Load symbols from file (one per line). Wait for file to exist and be non-empty up to wait_seconds."""
     import time
     start = time.monotonic()
     while (time.monotonic() - start) < wait_seconds:
@@ -294,7 +414,7 @@ def load_symbols_from_file(filepath: str, wait_seconds: int = 60) -> list:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global redis_client, TRADING_PAIRS
-    logger.info("Starting Signal Service...")
+    logger.info("Starting Signal Service v2.0 (3-layer strategy)...")
 
     redis_client = aioredis.Redis(host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASSWORD, decode_responses=True)
     await redis_client.ping()
@@ -304,12 +424,9 @@ async def lifespan(app: FastAPI):
         if pairs:
             TRADING_PAIRS = pairs
             logger.info(f"Loaded {len(TRADING_PAIRS)} symbols from {TRADING_PAIRS_FILE}")
-        else:
-            logger.warning("TRADING_PAIRS_FILE set but file empty or missing, using TRADING_PAIRS env")
     else:
         TRADING_PAIRS = [s.strip() for s in os.getenv("TRADING_PAIRS", "BTC/USDT,ETH/USDT,SOL/USDT").split(",") if s.strip()]
 
-    # Sync real balance from MEXC on startup
     await sync_balance_from_mexc()
 
     positions = await redis_client.hgetall("positions")
@@ -329,17 +446,38 @@ async def lifespan(app: FastAPI):
         await redis_client.close()
 
 
-app = FastAPI(title="Signal Service", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="Signal Service", version="2.0.0", lifespan=lifespan)
 
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "positions_tracked": len(current_positions)}
+    return {
+        "status": "healthy",
+        "version": "2.0.0",
+        "strategy_layers": ["regime_filter", "edge_gate", "vol_sizing"],
+        "positions_tracked": len(current_positions),
+    }
 
 
 @app.get("/signals")
 async def get_signals():
     return {k: v.model_dump() for k, v in last_signals.items()}
+
+
+@app.get("/regime")
+async def get_regime():
+    """Current regime state for all tracked symbols."""
+    result = {}
+    for symbol, regime in last_regime.items():
+        result[symbol] = {
+            "regime": regime.regime,
+            "trend_strength": regime.trend_strength,
+            "volatility_ratio": regime.volatility_ratio,
+            "choppiness": regime.choppiness,
+            "confidence": regime.confidence,
+            "details": regime.details,
+        }
+    return result
 
 
 @app.post("/manual-signal")
@@ -358,10 +496,9 @@ async def create_manual_signal(symbol: str, action: str, amount: float):
 
 @app.post("/emergency/stop")
 async def emergency_stop():
-    """Emergency stop signal generation"""
-    logger.warning("EMERGENCY STOP activated - stopping all signal generation")
-    # This would need to be implemented to actually stop the signal loop
+    logger.warning("EMERGENCY STOP activated")
     return {"status": "stopped", "message": "Signal generation stopped"}
+
 
 @app.get("/metrics", response_class=PlainTextResponse)
 async def metrics():

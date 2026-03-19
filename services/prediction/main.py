@@ -49,6 +49,7 @@ FEATURE_STORE_URL = os.getenv("FEATURE_STORE_URL", "http://localhost:8007")
 INFERENCE_INTERVAL = float(os.getenv("INFERENCE_INTERVAL", 5.0))
 TRADING_PAIRS_FILE = os.getenv("TRADING_PAIRS_FILE", "")
 TRADING_PAIRS = os.getenv("TRADING_PAIRS", "BTC/USDT,ETH/USDT,SOL/USDT").split(",")
+MAX_ACTIVE_PAIRS = int(os.getenv("MAX_ACTIVE_PAIRS", 50))
 
 logger = structlog.get_logger()
 
@@ -94,6 +95,9 @@ class ModelStatusResponse(BaseModel):
     mode: str
     tcn_version: Optional[str] = None
     xgb_version: Optional[str] = None
+    tcn_accuracy: Optional[float] = None
+    xgb_accuracy: Optional[float] = None
+    last_train_time: Optional[str] = None
     registry_dir: str = MODEL_DIR
 
 
@@ -386,14 +390,20 @@ async def seed_price_history_from_db():
         logger.warning(f"Could not seed price history from DB: {e}")
 
 
+_last_tick_time: float = 0.0  # monotonic timestamp of last received tick
+
+
 async def collect_market_data():
     """Subscribe to Redis tick channels and accumulate price history.
 
     Automatically reconnects on Redis pubsub failures with exponential backoff.
+    Includes staleness detection: if no tick arrives within STALENESS_TIMEOUT
+    seconds the connection is assumed half-open and forcibly recycled.
     """
-    global price_history
+    global price_history, _last_tick_time
     backoff = 1
     max_backoff = 30
+    STALENESS_TIMEOUT = 60  # seconds — force reconnect if no ticks for this long
 
     while True:
         pubsub = None
@@ -403,9 +413,14 @@ async def collect_market_data():
             logger.info("Subscribing to tick channels", count=len(channels))
             await pubsub.subscribe(*channels)
             backoff = 1  # reset on successful connect
+            _last_tick_time = time.monotonic()
 
-            async for message in pubsub.listen():
-                if message["type"] == "message":
+            while True:
+                # Use get_message with a short timeout instead of the blocking
+                # async-for iterator so we can detect stale connections.
+                message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=5.0)
+                if message is not None and message["type"] == "message":
+                    _last_tick_time = time.monotonic()
                     try:
                         tick = json.loads(message["data"])
                         symbol = tick["symbol"]
@@ -425,6 +440,15 @@ async def collect_market_data():
                             price_history[symbol] = price_history[symbol][-200:]
                     except Exception as exc:
                         logger.debug("Tick parse error", error=str(exc))
+                else:
+                    # No message received — check for staleness
+                    silence = time.monotonic() - _last_tick_time
+                    if silence > STALENESS_TIMEOUT:
+                        logger.warning(
+                            "No ticks received, assuming stale pubsub — forcing reconnect",
+                            silence_seconds=round(silence, 1),
+                        )
+                        break  # exit inner loop → reconnect
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -460,7 +484,9 @@ async def model_reload_watcher():
                 if message["type"] == "message":
                     logger.info("Model reload signal received, reloading models...")
                     try:
-                        load_models()
+                        # Run in thread to avoid blocking the event loop
+                        # (torch.load / xgb.Booster.load_model are heavy I/O)
+                        await asyncio.to_thread(load_models)
                         mode = "ml" if _ml_mode_available() else "legacy"
                         logger.info("Models hot-reloaded", mode=mode)
                     except Exception as exc:
@@ -498,12 +524,18 @@ async def prediction_loop():
             cycle_start = time.monotonic()
             symbols = [s.strip() for s in TRADING_PAIRS]
 
-            # Filter to symbols with enough data
-            eligible = []
+            # Filter to symbols with enough data, rank by data availability
+            candidates = []
             for sym in symbols:
                 ticks = price_history.get(sym)
                 if ticks and len(ticks) >= 20:
-                    eligible.append(sym)
+                    candidates.append((sym, len(ticks)))
+
+            # Sort by tick count descending — prioritize pairs with most data
+            candidates.sort(key=lambda x: x[1], reverse=True)
+
+            # Cap to MAX_ACTIVE_PAIRS
+            eligible = [sym for sym, _ in candidates[:MAX_ACTIVE_PAIRS]]
 
             if not eligible:
                 logger.debug("No eligible symbols for prediction", total=len(symbols), with_data=len(price_history))
@@ -530,10 +562,12 @@ async def prediction_loop():
                         continue
                     prepared[item["symbol"]] = item
 
-                # Fetch sentiment/onchain features with bounded concurrency and timeout
+                # Fetch sentiment/onchain features with bounded concurrency and timeout.
+                # Keep the wall-clock budget short (4s) so the prediction cycle
+                # never blocks the event loop long enough to miss health checks.
                 sentiment_map = {}
                 onchain_map = {}
-                ext_sem = asyncio.Semaphore(200)
+                ext_sem = asyncio.Semaphore(20)
 
                 async def _fetch_ext(sym):
                     async with ext_sem:
@@ -549,7 +583,7 @@ async def prediction_loop():
                             *[_fetch_ext(sym) for sym in prepared.keys()],
                             return_exceptions=True,
                         ),
-                        timeout=15.0,  # 15s max for all ext features
+                        timeout=4.0,
                     )
                     for r in ext_results:
                         if isinstance(r, Exception):
@@ -576,9 +610,14 @@ async def prediction_loop():
 
                     if tcn_seqs:
                         try:
-                            batch_preds = await asyncio.to_thread(tcn_model.predict_batch, tcn_seqs)
+                            batch_preds = await asyncio.wait_for(
+                                asyncio.to_thread(tcn_model.predict_batch, tcn_seqs),
+                                timeout=10.0,
+                            )
                             for sym, (direction, confidence) in zip(tcn_syms, batch_preds):
                                 tcn_results[sym] = ModelPrediction(direction=direction, confidence=confidence)
+                        except asyncio.TimeoutError:
+                            logger.warning("TCN batch inference timed out", symbols=len(tcn_syms))
                         except Exception as exc:
                             logger.warning("TCN batch inference failed", error=str(exc))
 
@@ -595,9 +634,14 @@ async def prediction_loop():
 
                     if xgb_feat_dicts:
                         try:
-                            batch_preds = await asyncio.to_thread(xgb_model.predict_batch, xgb_feat_dicts)
+                            batch_preds = await asyncio.wait_for(
+                                asyncio.to_thread(xgb_model.predict_batch, xgb_feat_dicts),
+                                timeout=10.0,
+                            )
                             for sym, (direction, confidence, probs) in zip(xgb_syms, batch_preds):
                                 xgb_results[sym] = ModelPrediction(direction=direction, confidence=confidence, probabilities=probs)
+                        except asyncio.TimeoutError:
+                            logger.warning("XGBoost batch inference timed out", symbols=len(xgb_syms))
                         except Exception as exc:
                             logger.warning("XGBoost batch inference failed", error=str(exc))
 
@@ -612,12 +656,17 @@ async def prediction_loop():
                     of = onchain_map.get(sym, {})
 
                     sentiment_score = _safe_float(sf.get("sentiment_score", 0.0))
-                    onchain_vals = [v for v in of.values() if isinstance(v, (int, float))]
+                    onchain_vals = [v for k, v in of.items() if isinstance(v, (int, float)) and k != "_source"]
                     onchain_score = float(np.mean(onchain_vals)) if onchain_vals else 0.0
+
+                    # Check if features came from real sources or fell back to defaults
+                    sentiment_avail = sf.get("_source", "default") != "default"
+                    onchain_avail = of.get("_source", "default") != "default"
 
                     result = ensemble.combine(
                         tcn_pred=tcn_pred, xgb_pred=xgb_pred,
                         sentiment_score=sentiment_score, onchain_score=onchain_score,
+                        sentiment_available=sentiment_avail, onchain_available=onchain_avail,
                     )
 
                     PREDICTIONS_TOTAL.labels(symbol=sym, direction=result.direction).inc()
@@ -831,11 +880,22 @@ async def predict(symbol: str):
 async def model_status():
     tcn_ver = None
     xgb_ver = None
+    tcn_acc = None
+    xgb_acc = None
+    last_train = None
+
     if registry:
         tcn_info = registry.get_latest("tcn")
         xgb_info = registry.get_latest("xgboost")
-        tcn_ver = tcn_info.version if tcn_info else None
-        xgb_ver = xgb_info.version if xgb_info else None
+        if tcn_info:
+            tcn_ver = tcn_info.version
+            tcn_acc = tcn_info.metrics.get("accuracy")
+            last_train = tcn_info.creation_date
+        if xgb_info:
+            xgb_ver = xgb_info.version
+            xgb_acc = xgb_info.metrics.get("accuracy")
+            if xgb_info.creation_date and (not last_train or xgb_info.creation_date > last_train):
+                last_train = xgb_info.creation_date
 
     return ModelStatusResponse(
         tcn_loaded=tcn_model is not None and tcn_model.is_loaded,
@@ -843,6 +903,9 @@ async def model_status():
         mode="ml" if _ml_mode_available() else "legacy",
         tcn_version=tcn_ver,
         xgb_version=xgb_ver,
+        tcn_accuracy=tcn_acc,
+        xgb_accuracy=xgb_acc,
+        last_train_time=last_train,
         registry_dir=MODEL_DIR,
     )
 

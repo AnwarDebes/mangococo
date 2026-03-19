@@ -1,7 +1,7 @@
 "use client";
 
 import { useTrades } from "@/hooks/usePortfolio";
-import { formatPercent, cn, getPnlColor } from "@/lib/utils";
+import { formatPercent, cn, getPnlColor, computeMaxDrawdown } from "@/lib/utils";
 import EquityCurve from "@/components/charts/EquityCurve";
 import TradeHistory from "@/components/panels/TradeHistory";
 import StressTest from "@/components/panels/StressTest";
@@ -72,16 +72,15 @@ export default function AnalyticsPage() {
   const grossLoss = Math.abs(lossTrades.reduce((s, t) => s + t.realized_pnl, 0));
   const profitFactor = grossLoss > 0 ? grossProfit / grossLoss : grossProfit > 0 ? Infinity : 0;
 
-  const maxDrawdown =
-    trades && trades.length > 0
-      ? Math.min(...trades.map((t) => t.pnl_pct), 0)
-      : 0;
+  const hasSufficientTrades = totalTrades >= 5;
 
-  // Build equity curve from trades
+  const maxDrawdown = computeMaxDrawdown(trades ?? [], 1000);
+
+  // Build equity curve from trades using real starting capital ($1000)
   const equityData =
     trades && trades.length > 0
       ? (() => {
-          let balance = 10000;
+          let balance = 1000;
           const sorted = [...trades].sort(
             (a, b) =>
               new Date(a.closed_at).getTime() - new Date(b.closed_at).getTime()
@@ -121,13 +120,13 @@ export default function AnalyticsPage() {
       <div className="grid grid-cols-2 gap-2 sm:gap-3 lg:grid-cols-3 xl:grid-cols-5">
         <StatCard
           label="Sharpe Ratio"
-          value={sharpe.toFixed(2)}
-          color={sharpe >= 1 ? "text-profit" : "text-neutral"}
+          value={hasSufficientTrades ? sharpe.toFixed(2) : "N/A"}
+          color={hasSufficientTrades && sharpe >= 1 ? "text-profit" : "text-neutral"}
         />
         <StatCard
           label="Sortino Ratio"
-          value={sortino.toFixed(2)}
-          color={sortino >= 1 ? "text-profit" : "text-neutral"}
+          value={hasSufficientTrades ? sortino.toFixed(2) : "N/A"}
+          color={hasSufficientTrades && sortino >= 1 ? "text-profit" : "text-neutral"}
         />
         <StatCard
           label="Win Rate"

@@ -8,7 +8,7 @@ import {
   BarChart3,
 } from "lucide-react";
 import { usePortfolio, usePositions, useTrades } from "@/hooks/usePortfolio";
-import { formatPercent, cn, getPnlColor } from "@/lib/utils";
+import { formatPercent, cn, getPnlColor, computeMaxDrawdown } from "@/lib/utils";
 import PortfolioCard from "@/components/panels/PortfolioCard";
 import PositionCard from "@/components/panels/PositionCard";
 import TradeHistory from "@/components/panels/TradeHistory";
@@ -110,11 +110,9 @@ export default function DashboardPage() {
         )
       : 1;
   const sharpe = stdDev > 0 ? (avgReturn / stdDev) * Math.sqrt(252) : 0;
+  const hasSufficientTrades = (trades?.length ?? 0) >= 5;
 
-  const maxDrawdown =
-    trades && trades.length > 0
-      ? Math.min(...trades.map((t) => t.pnl_pct), 0)
-      : 0;
+  const maxDrawdown = computeMaxDrawdown(trades ?? [], portfolio?.total_value ?? 1000);
 
   return (
     <div className="space-y-4 sm:space-y-6">
@@ -150,10 +148,10 @@ export default function DashboardPage() {
         />
         <MetricCard
           label="Sharpe Ratio"
-          value={sharpe.toFixed(2)}
-          numericValue={sharpe}
+          value={hasSufficientTrades ? sharpe.toFixed(2) : "N/A"}
+          numericValue={hasSufficientTrades ? sharpe : undefined}
           icon={TrendingUp}
-          color={sharpe >= 1 ? "text-profit" : "text-neutral"}
+          color={hasSufficientTrades && sharpe >= 1 ? "text-profit" : "text-neutral"}
           delay={100}
         />
         <MetricCard

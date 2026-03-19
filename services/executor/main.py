@@ -25,7 +25,7 @@ REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "")
 PAPER_MODE = os.getenv("PAPER_MODE", "false").lower() == "true"
-STARTING_CAPITAL = float(os.getenv("STARTING_CAPITAL", 11.0))
+STARTING_CAPITAL = float(os.getenv("STARTING_CAPITAL", 1000.0))
 
 # Signal channel: prefer sized_signals from portfolio-optimizer, fallback to validated_signals
 SIGNAL_CHANNEL = os.getenv("SIGNAL_CHANNEL", "sized_signals")

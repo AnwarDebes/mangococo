@@ -81,13 +81,20 @@ export default function PositionCard({ position }: PositionCardProps) {
       </div>
 
       <div className="mt-3 flex items-center gap-4 text-xs text-gray-500">
+        {position.stop_loss_price != null && position.stop_loss_price > 0 && (
+          <div className="flex items-center gap-1">
+            <Shield size={12} className="text-red-400" />
+            <span>SL: ${formatPrice(position.stop_loss_price)}</span>
+          </div>
+        )}
+        {position.take_profit_price != null && position.take_profit_price > 0 && (
+          <div className="flex items-center gap-1">
+            <Target size={12} className="text-green-400" />
+            <span>TP: ${formatPrice(position.take_profit_price)}</span>
+          </div>
+        )}
         <div className="flex items-center gap-1">
-          <Shield size={12} className="text-red-400" />
-          <span>SL: ${formatPrice(position.stop_loss_price)}</span>
-        </div>
-        <div className="flex items-center gap-1">
-          <Target size={12} className="text-green-400" />
-          <span>TP: ${formatPrice(position.take_profit_price)}</span>
+          <span className="text-blue-400">AI-managed exit</span>
         </div>
       </div>
     </div>

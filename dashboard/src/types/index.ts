@@ -5,8 +5,8 @@ export interface Position {
   current_price: number;
   amount: number;
   unrealized_pnl: number;
-  stop_loss_price: number;
-  take_profit_price: number;
+  stop_loss_price?: number;  // Legacy — AI controls exits, no longer set by position manager
+  take_profit_price?: number;  // Legacy — AI controls exits, no longer set by position manager
   opened_at: string;
 }
 
@@ -72,8 +72,8 @@ export interface SignalExplanation {
   action: "BUY" | "SELL" | "HOLD";
   confidence: number;
   timestamp: string;
-  tcn_prediction: { direction: string; confidence: number; weight: number };
-  xgb_prediction: { direction: string; confidence: number; weight: number };
+  tcn_prediction: { direction: string; confidence: number; weight: number } | null;
+  xgb_prediction: { direction: string; confidence: number; weight: number } | null;
   models_agree: boolean;
   top_factors: Array<{
     feature: string;
@@ -84,21 +84,22 @@ export interface SignalExplanation {
   }>;
   market_snapshot: {
     price: number;
-    rsi: number;
-    macd_signal: "bullish" | "bearish" | "neutral";
-    volume_vs_avg: number;
-    trend: "uptrend" | "downtrend" | "sideways";
-    volatility: "low" | "medium" | "high";
-    support_level: number;
-    resistance_level: number;
+    rsi: number | null;
+    macd_signal: string | null;
+    volume_vs_avg: number | null;
+    trend: string | null;
+    volatility: string | null;
+    support_level: number | null;
+    resistance_level: number | null;
   };
   risk_assessment: {
-    risk_score: number;
-    position_size_pct: number;
-    stop_loss: number;
-    take_profit: number;
-    risk_reward_ratio: number;
+    risk_score: number | null;
+    position_size_pct: number | null;
+    stop_loss: number | null;
+    take_profit: number | null;
+    risk_reward_ratio: number | null;
   };
+  data_quality?: "real" | "partial" | "unavailable";
 }
 
 /* ── Phase 4: War Room ───────────────────────────────────────────── */

@@ -74,7 +74,7 @@ SELECT create_hypertable('portfolio_snapshots', 'time', if_not_exists => TRUE);
 
 -- Initial portfolio
 INSERT INTO portfolio_snapshots (time, total_value, cash_balance, positions_value, daily_pnl)
-VALUES (NOW(), 11.00, 11.00, 0, 0) ON CONFLICT DO NOTHING;
+VALUES (NOW(), 1000.00, 1000.00, 0, 0) ON CONFLICT DO NOTHING;
 
 -- =============================================
 -- NEW TABLES (v2.0)

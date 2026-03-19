@@ -130,8 +130,8 @@ function mapPosition(symbolKey: string, rawValue: unknown): Position {
     current_price: currentPrice,
     amount,
     unrealized_pnl: unrealizedPnl,
-    stop_loss_price: asNumber(row.stop_loss_price),
-    take_profit_price: asNumber(row.take_profit_price),
+    stop_loss_price: asNumber(row.stop_loss_price) || undefined,
+    take_profit_price: asNumber(row.take_profit_price) || undefined,
     opened_at: toIso(row.opened_at || row.entry_time || row.created_at),
   };
 }
@@ -397,22 +397,21 @@ export async function getModelStatus(): Promise<ModelStatus[]> {
 
     const tcnLoaded = Boolean(root.tcn_loaded);
     const xgbLoaded = Boolean(root.xgb_loaded);
-    const mode = String(root.mode || "legacy").toLowerCase();
-    const now = new Date().toISOString();
+    const lastTrain = root.last_train_time ? String(root.last_train_time) : new Date().toISOString();
 
     return [
       {
         model_name: "tcn",
         version: String(root.tcn_version || "unavailable"),
-        accuracy: tcnLoaded ? (mode === "ml" ? 0.7 : 0.55) : 0,
-        last_retrain: now,
+        accuracy: asNumber(root.tcn_accuracy, 0),
+        last_retrain: lastTrain,
         status: tcnLoaded ? "active" : "inactive",
       },
       {
         model_name: "xgboost",
         version: String(root.xgb_version || "unavailable"),
-        accuracy: xgbLoaded ? (mode === "ml" ? 0.7 : 0.55) : 0,
-        last_retrain: now,
+        accuracy: asNumber(root.xgb_accuracy, 0),
+        last_retrain: lastTrain,
         status: xgbLoaded ? "active" : "inactive",
       },
     ];
@@ -571,7 +570,7 @@ export async function getSignalExplanation(signalId: string, symbol: string): Pr
   try {
     return await requestJson(`/api/v2/signals/${signalId}/explain`);
   } catch {
-    // Build explanation from available ticker data
+    // Build partial explanation from real ticker data only — no fabricated values
     try {
       const ticker = await getTicker(symbol);
       const t = asRecord(ticker);
@@ -580,29 +579,30 @@ export async function getSignalExplanation(signalId: string, symbol: string): Pr
         signal_id: signalId,
         symbol,
         action: "HOLD",
-        confidence: 0.5,
+        confidence: 0,
         timestamp: new Date().toISOString(),
-        tcn_prediction: { direction: "HOLD", confidence: 0.5, weight: 0.6 },
-        xgb_prediction: { direction: "HOLD", confidence: 0.5, weight: 0.4 },
-        models_agree: true,
+        tcn_prediction: null,
+        xgb_prediction: null,
+        models_agree: false,
         top_factors: [],
         market_snapshot: {
           price,
-          rsi: 50,
-          macd_signal: "neutral",
-          volume_vs_avg: 1,
-          trend: "sideways",
-          volatility: "medium",
-          support_level: price * 0.95,
-          resistance_level: price * 1.05,
+          rsi: null,
+          macd_signal: null,
+          volume_vs_avg: null,
+          trend: null,
+          volatility: null,
+          support_level: null,
+          resistance_level: null,
         },
         risk_assessment: {
-          risk_score: 50,
-          position_size_pct: 10,
-          stop_loss: price * 0.97,
-          take_profit: price * 1.03,
-          risk_reward_ratio: 1.5,
+          risk_score: null,
+          position_size_pct: null,
+          stop_loss: null,
+          take_profit: null,
+          risk_reward_ratio: null,
         },
+        data_quality: "partial" as const,
       };
     } catch {
       return null;

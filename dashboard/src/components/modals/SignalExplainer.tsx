@@ -76,9 +76,11 @@ export default function SignalExplainer({ signalId, symbol, onClose }: Props) {
     );
   }
 
+  const isPartial = data.data_quality === "partial";
+
   const radarData = [
-    { axis: "RSI", value: data.market_snapshot.rsi },
-    { axis: "Volume", value: Math.min(100, data.market_snapshot.volume_vs_avg * 40) },
+    { axis: "RSI", value: data.market_snapshot.rsi ?? 50 },
+    { axis: "Volume", value: Math.min(100, (data.market_snapshot.volume_vs_avg ?? 1) * 40) },
     { axis: "Trend", value: data.market_snapshot.trend === "uptrend" ? 80 : data.market_snapshot.trend === "downtrend" ? 20 : 50 },
     { axis: "Volatility", value: data.market_snapshot.volatility === "high" ? 90 : data.market_snapshot.volatility === "medium" ? 50 : 20 },
     { axis: "Sentiment", value: 50 + (data.top_factors.find((f) => f.feature.includes("sentiment"))?.impact || 0) * 50 },
@@ -117,10 +119,14 @@ export default function SignalExplainer({ signalId, symbol, onClose }: Props) {
                 <span className="text-gray-300">{data.models_agree ? "Models agree" : "Models disagree"}</span>
               </div>
               <div className="space-y-1">
+                {data.tcn_prediction ? (<>
                 <div className="flex justify-between"><span className="text-gray-500">TCN</span><span className="text-gray-300">{data.tcn_prediction.direction} ({(data.tcn_prediction.confidence * 100).toFixed(0)}%)</span></div>
                 <div className="h-1.5 rounded-full bg-gray-700"><div className="h-1.5 rounded-full bg-purple-500 transition-all" style={{ width: `${data.tcn_prediction.confidence * 100}%` }} /></div>
+                </>) : <div className="text-gray-500 text-[10px]">TCN: N/A</div>}
+                {data.xgb_prediction ? (<>
                 <div className="flex justify-between"><span className="text-gray-500">XGBoost</span><span className="text-gray-300">{data.xgb_prediction.direction} ({(data.xgb_prediction.confidence * 100).toFixed(0)}%)</span></div>
                 <div className="h-1.5 rounded-full bg-gray-700"><div className="h-1.5 rounded-full bg-blue-500 transition-all" style={{ width: `${data.xgb_prediction.confidence * 100}%` }} /></div>
+                </>) : <div className="text-gray-500 text-[10px]">XGBoost: N/A</div>}
               </div>
             </div>
           </div>
@@ -172,21 +178,27 @@ export default function SignalExplainer({ signalId, symbol, onClose }: Props) {
                 </RadarChart>
               </ResponsiveContainer>
               <div className="flex justify-between text-xs text-gray-500 mt-2">
-                <span>Support: ${data.market_snapshot.support_level.toLocaleString()}</span>
-                <span>Resistance: ${data.market_snapshot.resistance_level.toLocaleString()}</span>
+                <span>Support: {data.market_snapshot.support_level != null ? `$${data.market_snapshot.support_level.toLocaleString()}` : "N/A"}</span>
+                <span>Resistance: {data.market_snapshot.resistance_level != null ? `$${data.market_snapshot.resistance_level.toLocaleString()}` : "N/A"}</span>
               </div>
+              {isPartial && <p className="text-[10px] text-yellow-500/80 mt-1">Limited data — detailed analysis unavailable</p>}
             </div>
 
             {/* Risk Profile */}
             <div className="card p-4 space-y-4">
               <h3 className="text-sm font-semibold text-white">Risk Profile</h3>
-              <RiskGauge score={data.risk_assessment.risk_score} />
+              {data.risk_assessment.risk_score != null ? (
+                <RiskGauge score={data.risk_assessment.risk_score} />
+              ) : (
+                <p className="text-xs text-gray-500 text-center">Risk score unavailable</p>
+              )}
               <div className="grid grid-cols-2 gap-3 text-xs">
-                <div><span className="text-gray-500">Position Size</span><p className="font-mono text-white">{data.risk_assessment.position_size_pct.toFixed(1)}%</p></div>
-                <div><span className="text-gray-500">R:R Ratio</span><p className="font-mono text-white">{data.risk_assessment.risk_reward_ratio.toFixed(2)}</p></div>
-                <div><span className="text-gray-500">Stop Loss</span><p className="font-mono text-red-400">${data.risk_assessment.stop_loss.toLocaleString()}</p></div>
-                <div><span className="text-gray-500">Take Profit</span><p className="font-mono text-green-400">${data.risk_assessment.take_profit.toLocaleString()}</p></div>
+                <div><span className="text-gray-500">Position Size</span><p className="font-mono text-white">{data.risk_assessment.position_size_pct != null ? `${data.risk_assessment.position_size_pct.toFixed(1)}%` : "N/A"}</p></div>
+                <div><span className="text-gray-500">R:R Ratio</span><p className="font-mono text-white">{data.risk_assessment.risk_reward_ratio != null ? data.risk_assessment.risk_reward_ratio.toFixed(2) : "N/A"}</p></div>
+                <div><span className="text-gray-500">Stop Loss</span><p className="font-mono text-red-400">{data.risk_assessment.stop_loss != null ? `$${data.risk_assessment.stop_loss.toLocaleString()}` : "N/A"}</p></div>
+                <div><span className="text-gray-500">Take Profit</span><p className="font-mono text-green-400">{data.risk_assessment.take_profit != null ? `$${data.risk_assessment.take_profit.toLocaleString()}` : "N/A"}</p></div>
               </div>
+              {data.risk_assessment.risk_reward_ratio != null && (<>
               {/* R:R visual bar */}
               <div className="flex h-3 rounded-full overflow-hidden">
                 <div className="bg-red-500/60" style={{ width: `${(1 / (1 + data.risk_assessment.risk_reward_ratio)) * 100}%` }} />
@@ -195,6 +207,7 @@ export default function SignalExplainer({ signalId, symbol, onClose }: Props) {
               <div className="flex justify-between text-[10px] text-gray-500">
                 <span>Risk</span><span>Reward</span>
               </div>
+              </>)}
             </div>
           </div>
         </div>
