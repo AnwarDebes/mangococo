@@ -40,9 +40,7 @@ export function formatPrice(value: unknown): string {
 }
 
 export function formatPercent(value: unknown, fractionDigits = 2): string {
-  const raw = toNumber(value);
-  // Heuristic: values in [-1,1] are treated as fractional returns.
-  const pct = Math.abs(raw) <= 1 ? raw * 100 : raw;
+  const pct = toNumber(value);
   const sign = pct > 0 ? "+" : "";
   return `${sign}${pct.toFixed(fractionDigits)}%`;
 }
