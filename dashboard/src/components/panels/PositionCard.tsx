@@ -49,7 +49,7 @@ export default function PositionCard({ position }: PositionCardProps) {
         <div>
           <p className="text-xs text-gray-500">Entry</p>
           <p className="text-sm font-mono text-gray-300">
-            ${formatPrice(position.entry_price)}
+            {position.entry_price > 0 ? `$${formatPrice(position.entry_price)}` : "N/A"}
           </p>
         </div>
         <div>
@@ -58,6 +58,13 @@ export default function PositionCard({ position }: PositionCardProps) {
             ${formatPrice(position.current_price)}
           </p>
         </div>
+      </div>
+
+      <div className="mt-1">
+        <p className="text-xs text-gray-500">Value</p>
+        <p className="text-sm font-mono text-white">
+          {formatCurrency(position.current_price * position.amount)}
+        </p>
       </div>
 
       <div className="mt-3 flex items-center justify-between">

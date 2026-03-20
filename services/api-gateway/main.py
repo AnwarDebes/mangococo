@@ -421,12 +421,17 @@ async def get_portfolio_v2():
         # Merge executor positions into the positions list for complete view
         pos_service_positions = portfolio.get("positions", {})
         for sym, exec_pos in positions_dict.items():
-            if sym not in pos_service_positions:
+            price = exec_pos.get("price", 0)
+            if sym in pos_service_positions:
+                # Update current_price from executor (real-time)
+                pos_service_positions[sym]["current_price"] = price
+            else:
+                # Executor-only position: entry_price unknown (set to 0)
                 pos_service_positions[sym] = {
                     "symbol": sym,
                     "side": "long",
-                    "entry_price": exec_pos.get("price", 0),
-                    "current_price": exec_pos.get("price", 0),
+                    "entry_price": 0,
+                    "current_price": price,
                     "amount": exec_pos.get("amount", 0),
                     "unrealized_pnl": 0,
                     "status": "open",
@@ -454,12 +459,47 @@ async def get_portfolio_v2():
 
 @app.get("/api/v2/positions")
 async def get_positions_v2():
-    """Get all open positions with current prices."""
+    """Get all open positions with current prices.
+
+    Merges position-service positions with executor paper-portfolio
+    positions so that every coin the executor holds is visible.
+    """
+    positions: dict = {}
+
+    # 1. Position service positions (authoritative for entry_price / PnL)
     try:
-        response = await http_client.get(f"{SERVICES['position']}/positions", timeout=5.0)
-        return response.json()
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        resp = await http_client.get(f"{SERVICES['position']}/positions", timeout=5.0)
+        if resp.status_code == 200:
+            positions = resp.json()
+    except Exception:
+        pass
+
+    # 2. Executor paper-portfolio positions (source of truth for holdings)
+    try:
+        bal_resp = await http_client.get(f"{SERVICES['executor']}/balance", timeout=5.0)
+        if bal_resp.status_code == 200:
+            exec_positions = bal_resp.json().get("summary", {}).get("positions", {})
+            for sym, exec_pos in exec_positions.items():
+                price = exec_pos.get("price", 0)
+                amount = exec_pos.get("amount", 0)
+                if sym in positions:
+                    # Update current_price from executor (real-time)
+                    positions[sym]["current_price"] = price
+                else:
+                    # Executor-only position: no entry_price known
+                    positions[sym] = {
+                        "symbol": sym,
+                        "side": "long",
+                        "entry_price": 0,
+                        "current_price": price,
+                        "amount": amount,
+                        "unrealized_pnl": 0,
+                        "status": "open",
+                    }
+    except Exception:
+        pass
+
+    return positions
 
 
 @app.get("/api/v2/trades")

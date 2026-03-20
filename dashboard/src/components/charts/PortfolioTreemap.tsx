@@ -117,7 +117,7 @@ export default function PortfolioTreemap({ portfolio: propPortfolio, positions: 
               {hovered === item.symbol && !item.isCash && (
                 <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 z-20 rounded-lg bg-gray-800 border border-gray-700 p-3 text-[11px] space-y-1 whitespace-nowrap shadow-xl">
                   <p className="font-semibold text-white">{item.symbol}</p>
-                  <p className="text-gray-400">Entry: <span className="text-white font-mono">${item.entryPrice.toLocaleString()}</span></p>
+                  <p className="text-gray-400">Entry: <span className="text-white font-mono">{item.entryPrice > 0 ? `$${item.entryPrice.toLocaleString()}` : "N/A"}</span></p>
                   <p className="text-gray-400">Current: <span className="text-white font-mono">${item.currentPrice.toLocaleString()}</span></p>
                   <p className="text-gray-400">Unrealized: <span className={cn("font-mono", item.unrealizedPnl >= 0 ? "text-green-400" : "text-red-400")}>{formatCurrency(item.unrealizedPnl)}</span></p>
                   <p className="text-gray-400">Open: {getTimeSince(item.openedAt)}</p>
