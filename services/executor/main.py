@@ -49,6 +49,7 @@ class OrderRequest(BaseModel):
     price: Optional[float] = None
     order_type: str = "limit"
     position_size_usd: Optional[float] = None  # From portfolio-optimizer
+    reason: str = ""
 
 
 class OrderResponse(BaseModel):
@@ -63,6 +64,7 @@ class OrderResponse(BaseModel):
     cost: float = 0
     timestamp: str
     mode: str = "live"
+    reason: str = ""
 
 
 # Global State
@@ -138,6 +140,7 @@ async def execute_paper_order(request: OrderRequest) -> OrderResponse:
             cost=order.get("cost", 0),
             timestamp=datetime.utcnow().isoformat(),
             mode="paper",
+            reason=request.reason,
         )
 
         # Store and publish
@@ -293,6 +296,7 @@ async def execute_live_order(request: OrderRequest) -> OrderResponse:
             symbol=request.symbol, side=request.side, amount=request.amount,
             price=order_price, filled=filled_amount, cost=order_cost,
             timestamp=datetime.utcnow().isoformat(), mode="live",
+            reason=request.reason,
         )
 
         if request.signal_id:
@@ -371,6 +375,7 @@ async def listen_for_signals():
                     amount=amount,
                     price=signal.get("price"),
                     position_size_usd=position_size_usd,
+                    reason=signal.get("reason", ""),
                 )
 
                 await execute_order(request)
