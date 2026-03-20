@@ -280,14 +280,17 @@ class BacktestEngine:
         self.equity_curve.clear()
         self.peak_equity = self.initial_capital
 
-        # Index signals by (time, symbol) for O(1) lookup
+        # Index signals by (time, symbol) for O(1) lookup — vectorized construction
         signal_lookup: Dict[tuple, Dict] = {}
         if not signals_df.empty:
-            for _, row in signals_df.iterrows():
-                key = (row["time"], row["symbol"])
-                signal_lookup[key] = {
-                    "action": row["action"],
-                    "confidence": row.get("confidence", 0.5),
+            sig_times = signals_df["time"].values
+            sig_symbols = signals_df["symbol"].values
+            sig_actions = signals_df["action"].values
+            sig_confs = signals_df["confidence"].values if "confidence" in signals_df.columns else np.full(len(signals_df), 0.5)
+            for i in range(len(signals_df)):
+                signal_lookup[(sig_times[i], sig_symbols[i])] = {
+                    "action": sig_actions[i],
+                    "confidence": float(sig_confs[i]),
                 }
 
         # Sort candles chronologically
@@ -296,13 +299,20 @@ class BacktestEngine:
 
         candle_count = 0
 
+        # Pre-group candles by timestamp for faster iteration
+        grouped = candles_df.groupby("time")
+
         for ts in timestamps:
-            ts_candles = candles_df[candles_df["time"] == ts]
+            ts_candles = grouped.get_group(ts)
             current_prices: Dict[str, float] = {}
 
-            for _, candle in ts_candles.iterrows():
-                symbol = candle["symbol"]
-                close_price = float(candle["close"])
+            # Vectorized access — avoid iterrows()
+            ts_symbols = ts_candles["symbol"].values
+            ts_closes = ts_candles["close"].values.astype(float)
+
+            for j in range(len(ts_symbols)):
+                symbol = ts_symbols[j]
+                close_price = ts_closes[j]
                 current_prices[symbol] = close_price
 
                 # Check for signal at this (time, symbol)
@@ -314,17 +324,13 @@ class BacktestEngine:
                 confidence = sig["confidence"]
 
                 if action == "buy":
-                    # Close any short position first
                     if symbol in self.positions and self.positions[symbol].side == "short":
                         self._close_position(symbol, close_price, ts)
-                    # Open long
                     self._open_position(symbol, "long", close_price, ts, confidence)
 
                 elif action == "sell":
-                    # Close any long position first
                     if symbol in self.positions and self.positions[symbol].side == "long":
                         self._close_position(symbol, close_price, ts)
-                    # Open short
                     self._open_position(symbol, "short", close_price, ts, confidence)
 
             # Record equity periodically

@@ -86,13 +86,21 @@ class EnsemblePrediction:
 # ---------------------------------------------------------------------------
 
 class EnsembleCombiner:
-    """Weighted ensemble combiner."""
+    """Weighted ensemble combiner with multi-TCN support."""
 
     WEIGHT_TCN = 0.35
     WEIGHT_XGB = 0.40
     WEIGHT_SENTIMENT = 0.15
     WEIGHT_ONCHAIN = 0.10
     AGREEMENT_BONUS = 0.15
+
+    # Per-variant weights within the TCN allocation (sum to 1.0)
+    TCN_VARIANT_WEIGHTS = {
+        "tcn_micro":  0.10,
+        "tcn_short":  0.20,
+        "tcn_medium": 0.40,  # Primary model gets highest weight
+        "tcn_long":   0.30,
+    }
 
     def combine(
         self,
@@ -102,6 +110,7 @@ class EnsembleCombiner:
         onchain_score: float = 0.0,
         sentiment_available: bool = True,
         onchain_available: bool = True,
+        multi_tcn_preds: Optional[list] = None,
     ) -> EnsemblePrediction:
         """
         Combine predictions from all sources into a single ensemble prediction.
@@ -129,8 +138,35 @@ class EnsembleCombiner:
         weighted_score = 0.0
         breakdown: Dict[str, float] = {}
 
-        # TCN contribution
-        if tcn_pred is not None:
+        # TCN contribution — supports multi-variant ensemble
+        # multi_tcn_preds: list of (variant_name, direction, confidence)
+        if multi_tcn_preds and len(multi_tcn_preds) > 0:
+            # Weighted combination of all TCN variants
+            variant_total_weight = 0.0
+            variant_weighted_score = 0.0
+            for variant_name, direction, confidence in multi_tcn_preds:
+                v_weight = self.TCN_VARIANT_WEIGHTS.get(variant_name, 0.15)
+                v_score = CLASS_TO_SCORE.get(direction, 0.0) * confidence
+                variant_weighted_score += v_weight * v_score
+                variant_total_weight += v_weight
+                breakdown[f"tcn_{variant_name}"] = round(v_score, 4)
+
+            if variant_total_weight > 0:
+                tcn_score = variant_weighted_score / variant_total_weight
+            else:
+                tcn_score = 0.0
+            weighted_score += self.WEIGHT_TCN * tcn_score
+            total_weight += self.WEIGHT_TCN
+            breakdown["tcn"] = round(tcn_score, 4)
+            breakdown["tcn_variants_used"] = len(multi_tcn_preds)
+
+            # Synthesize a single tcn_pred for agreement check below
+            if tcn_pred is None:
+                combined_dir = "up" if tcn_score > 0.1 else ("down" if tcn_score < -0.1 else "neutral")
+                tcn_pred = ModelPrediction(direction=combined_dir, confidence=abs(tcn_score))
+
+        elif tcn_pred is not None:
+            # Fallback: single TCN model (backwards compatible)
             tcn_score = CLASS_TO_SCORE.get(tcn_pred.direction, 0.0) * tcn_pred.confidence
             weighted_score += self.WEIGHT_TCN * tcn_score
             total_weight += self.WEIGHT_TCN

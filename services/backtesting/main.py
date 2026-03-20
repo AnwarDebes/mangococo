@@ -401,3 +401,66 @@ async def list_strategies():
         }
         for name, cls in STRATEGY_MAP.items()
     }
+
+
+# ---------------------------------------------------------------------------
+# Parallel backtest runner — runs multiple backtests across CPU cores
+# ---------------------------------------------------------------------------
+
+class ParallelBacktestRequest(BaseModel):
+    """Request to run multiple backtests in parallel (parameter sweep)."""
+    symbols: List[str] = Field(..., min_length=1)
+    start_date: datetime
+    end_date: datetime
+    strategies: List[str] = Field(default_factory=lambda: ["ml_ensemble"])
+    initial_capital: float = Field(default=10000.0, gt=0)
+    timeframe: str = Field(default="1m")
+    # Parameter sweep: each combo of these runs as a separate backtest
+    position_size_pcts: List[float] = Field(default_factory=lambda: [0.20])
+    max_positions_list: List[int] = Field(default_factory=lambda: [5])
+
+
+@app.post("/backtest/parallel")
+async def start_parallel_backtests(request: ParallelBacktestRequest):
+    """Launch multiple backtests in parallel across CPU cores.
+
+    Creates one backtest per combination of (strategy, position_size, max_positions).
+    With 89 idle CPU cores, dozens of backtests can run simultaneously.
+    """
+    run_ids = []
+    for strategy in request.strategies:
+        if strategy not in STRATEGY_MAP:
+            continue
+        for pos_pct in request.position_size_pcts:
+            for max_pos in request.max_positions_list:
+                bt_request = BacktestRequest(
+                    symbols=request.symbols,
+                    start_date=request.start_date,
+                    end_date=request.end_date,
+                    strategy=strategy,
+                    initial_capital=request.initial_capital,
+                    timeframe=request.timeframe,
+                    position_size_pct=pos_pct,
+                    max_positions=max_pos,
+                )
+                run_id = await db.create_run(
+                    strategy_name=strategy,
+                    symbols=request.symbols,
+                    start_date=request.start_date,
+                    end_date=request.end_date,
+                    initial_capital=request.initial_capital,
+                    params={
+                        "position_size_pct": pos_pct,
+                        "max_positions": max_pos,
+                        "timeframe": request.timeframe,
+                    },
+                )
+                asyncio.create_task(_run_backtest(run_id, bt_request))
+                run_ids.append(run_id)
+
+    return {
+        "status": "started",
+        "total_backtests": len(run_ids),
+        "run_ids": run_ids,
+        "message": f"Launched {len(run_ids)} parallel backtests. Poll GET /backtest/<id> for results.",
+    }

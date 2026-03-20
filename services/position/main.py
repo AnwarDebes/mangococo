@@ -45,6 +45,7 @@ REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "")
 AI_EXIT_CONFIDENCE = float(os.getenv("AI_EXIT_CONFIDENCE", 0.20))  # Min confidence for AI-driven exit
+SMART_STOP_ENABLED = os.getenv("SMART_STOP_ENABLED", "true").lower() == "true"
 
 # Exit pressure configuration (AI signal persistence)
 EXIT_PRESSURE_THRESHOLD = float(os.getenv("EXIT_PRESSURE_THRESHOLD", 1.5))  # Cumulative pressure to trigger exit
@@ -469,52 +470,53 @@ async def update_prices():
                     ai_threshold = pressure_state["threshold"]
 
                     # ── SMART ADAPTIVE STOP (6-layer) ──
-                    stop_result = compute_smart_stop(
-                        pnl_pct=pnl_pct,
-                        peak_pnl_pct=pos.peak_pnl_pct,
-                        atr_pct=atr_pct,
-                        rsi_14=rsi_14,
-                        volume_ratio=volume_ratio,
-                        momentum_5m=momentum_5m,
-                        momentum_15m=momentum_15m,
-                        momentum_30m=momentum_30m,
-                        macd_histogram=macd_histogram,
-                        ema_cross_9_21=ema_cross_9_21,
-                        ema_cross_25_50=ema_cross_25_50,
-                        regime=regime_name,
-                        ai_pressure=ai_pressure,
-                        ai_threshold=ai_threshold,
-                        hold_time_minutes=hold_time_minutes,
-                        bollinger_b=bollinger_b,
-                        side=pos.side,
-                    )
+                    if SMART_STOP_ENABLED:
+                        stop_result = compute_smart_stop(
+                            pnl_pct=pnl_pct,
+                            peak_pnl_pct=pos.peak_pnl_pct,
+                            atr_pct=atr_pct,
+                            rsi_14=rsi_14,
+                            volume_ratio=volume_ratio,
+                            momentum_5m=momentum_5m,
+                            momentum_15m=momentum_15m,
+                            momentum_30m=momentum_30m,
+                            macd_histogram=macd_histogram,
+                            ema_cross_9_21=ema_cross_9_21,
+                            ema_cross_25_50=ema_cross_25_50,
+                            regime=regime_name,
+                            ai_pressure=ai_pressure,
+                            ai_threshold=ai_threshold,
+                            hold_time_minutes=hold_time_minutes,
+                            bollinger_b=bollinger_b,
+                            side=pos.side,
+                        )
 
-                    # Mark trailing as active when stop is engaged
-                    if pos.peak_pnl_pct >= 0.01 and not pos.trailing_active:
-                        pos.trailing_active = True
-                        logger.info("Smart stop TRACKING",
-                                    symbol=symbol,
-                                    peak_pnl=f"{pos.peak_pnl_pct:.2%}",
-                                    stop_dist=f"{stop_result.stop_distance_pct:.2%}",
-                                    regime=regime_name,
-                                    mults=f"R{stop_result.regime_mult:.2f}|M{stop_result.momentum_mult:.2f}|V{stop_result.volume_mult:.2f}|T{stop_result.trend_mult:.2f}|A{stop_result.ai_mult:.2f}")
+                        # Mark trailing as active when stop is engaged
+                        if pos.peak_pnl_pct >= stop_result.stop_distance_pct and not pos.trailing_active:
+                            pos.trailing_active = True
+                            logger.info("Smart stop TRACKING",
+                                        symbol=symbol,
+                                        peak_pnl=f"{pos.peak_pnl_pct:.2%}",
+                                        stop_dist=f"{stop_result.stop_distance_pct:.2%}",
+                                        regime=regime_name,
+                                        mults=f"R{stop_result.regime_mult:.2f}|M{stop_result.momentum_mult:.2f}|V{stop_result.volume_mult:.2f}|T{stop_result.trend_mult:.2f}|A{stop_result.ai_mult:.2f}")
 
-                    if stop_result.should_exit:
-                        reason = stop_result.reason
-                        logger.info("SMART STOP triggered",
-                                    symbol=symbol,
-                                    reason=reason,
-                                    pnl_pct=f"{pnl_pct:.2%}",
-                                    peak_pnl=f"{pos.peak_pnl_pct:.2%}",
-                                    stop_dist=f"{stop_result.stop_distance_pct:.2%}",
-                                    base_atr=f"{stop_result.base_atr_stop:.4f}",
-                                    regime=regime_name,
-                                    mults=f"R{stop_result.regime_mult:.2f}|M{stop_result.momentum_mult:.2f}|V{stop_result.volume_mult:.2f}|T{stop_result.trend_mult:.2f}|A{stop_result.ai_mult:.2f}",
-                                    profit_usd=f"{pos.unrealized_pnl:.2f}",
-                                    ai_pressure=f"{ai_pressure:.3f}")
-                        smart_stop_triggered.append((symbol, reason))
-                        await redis_client.hset("positions", symbol, pos.model_dump_json())
-                        continue
+                        if stop_result.should_exit:
+                            reason = stop_result.reason
+                            logger.info("SMART STOP triggered",
+                                        symbol=symbol,
+                                        reason=reason,
+                                        pnl_pct=f"{pnl_pct:.2%}",
+                                        peak_pnl=f"{pos.peak_pnl_pct:.2%}",
+                                        stop_dist=f"{stop_result.stop_distance_pct:.2%}",
+                                        base_atr=f"{stop_result.base_atr_stop:.4f}",
+                                        regime=regime_name,
+                                        mults=f"R{stop_result.regime_mult:.2f}|M{stop_result.momentum_mult:.2f}|V{stop_result.volume_mult:.2f}|T{stop_result.trend_mult:.2f}|A{stop_result.ai_mult:.2f}",
+                                        profit_usd=f"{pos.unrealized_pnl:.2f}",
+                                        ai_pressure=f"{ai_pressure:.3f}")
+                            smart_stop_triggered.append((symbol, reason))
+                            await redis_client.hset("positions", symbol, pos.model_dump_json())
+                            continue
 
                 await redis_client.hset("positions", symbol, pos.model_dump_json())
 

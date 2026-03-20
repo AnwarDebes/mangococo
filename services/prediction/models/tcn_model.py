@@ -147,6 +147,17 @@ class TCNNetwork(nn.Module):
 
 DIRECTION_MAP = {0: "up", 1: "down", 2: "neutral"}
 
+# ---------------------------------------------------------------------------
+# Multi-timeframe TCN configuration
+# ---------------------------------------------------------------------------
+
+TCN_VARIANTS = [
+    {"name": "tcn_micro",  "seq_length": 15,  "hidden_channels": 128, "description": "Sub-minute momentum"},
+    {"name": "tcn_short",  "seq_length": 30,  "hidden_channels": 192, "description": "2-5 min scalping"},
+    {"name": "tcn_medium", "seq_length": 60,  "hidden_channels": 256, "description": "5-15 min swing (primary)"},
+    {"name": "tcn_long",   "seq_length": 120, "hidden_channels": 256, "description": "15-60 min trend following"},
+]
+
 
 class TCNModel:
     """High-level wrapper around :class:`TCNNetwork` for inference and persistence."""
@@ -286,3 +297,142 @@ class TCNModel:
             path,
         )
         logger.info("TCN model saved", path=path)
+
+
+# ---------------------------------------------------------------------------
+# Multi-Timeframe TCN Ensemble
+# ---------------------------------------------------------------------------
+
+class MultiTCNEnsemble:
+    """Manages multiple TCN models with different sequence lengths and architectures.
+
+    Each variant captures patterns at a different time horizon. The ensemble
+    combines their predictions with configurable weights for richer signals.
+    """
+
+    def __init__(self):
+        self.models: dict[str, TCNModel] = {}
+        self.variant_configs: dict[str, dict] = {}
+        self._loaded = False
+
+    @property
+    def is_loaded(self) -> bool:
+        return any(m.is_loaded for m in self.models.values())
+
+    def initialize_variants(self, model_dir: str) -> None:
+        """Create and load TCN variants from the model directory.
+
+        For each variant, tries to load a variant-specific checkpoint
+        (e.g., tcn_short_latest.pt). Falls back to loading the primary
+        model (tcn_latest.pt) into all variants — the different sequence
+        lengths still provide diversity even with shared weights.
+        """
+        primary_path = os.path.join(model_dir, "tcn_latest.pt")
+
+        for variant in TCN_VARIANTS:
+            name = variant["name"]
+            hc = variant["hidden_channels"]
+            self.variant_configs[name] = variant
+
+            model = TCNModel(n_features=20, hidden_channels=hc)
+
+            # Try variant-specific checkpoint first
+            variant_path = os.path.join(model_dir, f"{name}_latest.pt")
+            if os.path.isfile(variant_path):
+                try:
+                    model.load(variant_path)
+                    logger.info("Multi-TCN variant loaded", variant=name, path=variant_path)
+                    self.models[name] = model
+                    continue
+                except Exception as e:
+                    logger.warning("Failed to load variant checkpoint", variant=name, error=str(e))
+
+            # Fall back to primary model (with matching hidden_channels)
+            if os.path.isfile(primary_path):
+                try:
+                    model.load(primary_path)
+                    logger.info("Multi-TCN variant loaded from primary", variant=name,
+                                hidden_channels=hc)
+                    self.models[name] = model
+                except Exception as e:
+                    logger.warning("Failed to load primary model for variant",
+                                    variant=name, error=str(e))
+            else:
+                logger.info("No model file for variant", variant=name)
+
+        loaded = [n for n, m in self.models.items() if m.is_loaded]
+        logger.info("Multi-TCN ensemble initialized",
+                     total_variants=len(TCN_VARIANTS),
+                     loaded=len(loaded),
+                     variants=loaded)
+
+    def predict_all(self, feature_matrix: np.ndarray) -> list[tuple[str, str, float]]:
+        """Run inference across all loaded variants for a single symbol.
+
+        Parameters
+        ----------
+        feature_matrix : ndarray of shape (N, n_features)
+            Full feature matrix from which each variant slices its sequence.
+
+        Returns
+        -------
+        list of (variant_name, direction, confidence) tuples
+        """
+        results = []
+        for name, model in self.models.items():
+            if not model.is_loaded:
+                continue
+            seq_len = self.variant_configs[name]["seq_length"]
+            if len(feature_matrix) < seq_len:
+                continue
+            sequence = feature_matrix[-seq_len:]
+            try:
+                direction, confidence = model.predict(sequence)
+                results.append((name, direction, confidence))
+            except Exception as e:
+                logger.debug("Variant prediction failed", variant=name, error=str(e))
+        return results
+
+    def predict_batch_all(self, feature_matrices: dict[str, np.ndarray]) -> dict[str, list[tuple[str, str, float]]]:
+        """Batched inference across all variants for multiple symbols.
+
+        Parameters
+        ----------
+        feature_matrices : dict mapping symbol -> feature_matrix (N, n_features)
+
+        Returns
+        -------
+        dict mapping symbol -> list of (variant_name, direction, confidence)
+        """
+        all_results: dict[str, list[tuple[str, str, float]]] = {sym: [] for sym in feature_matrices}
+
+        for name, model in self.models.items():
+            if not model.is_loaded:
+                continue
+            seq_len = self.variant_configs[name]["seq_length"]
+
+            # Collect sequences for this variant
+            batch_syms = []
+            batch_seqs = []
+            for sym, feat_mat in feature_matrices.items():
+                if len(feat_mat) >= seq_len:
+                    batch_syms.append(sym)
+                    batch_seqs.append(feat_mat[-seq_len:])
+
+            if not batch_seqs:
+                continue
+
+            try:
+                batch_preds = model.predict_batch(batch_seqs)
+                for sym, (direction, confidence) in zip(batch_syms, batch_preds):
+                    all_results[sym].append((name, direction, confidence))
+            except Exception as e:
+                logger.warning("Variant batch prediction failed", variant=name, error=str(e))
+
+        return all_results
+
+    def reload(self, model_dir: str) -> None:
+        """Reload all variant models (called on hot-reload signal)."""
+        self.models.clear()
+        self.variant_configs.clear()
+        self.initialize_variants(model_dir)

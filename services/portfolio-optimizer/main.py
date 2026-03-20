@@ -236,19 +236,83 @@ async def listen_for_validated_signals():
 
 
 async def periodic_correlation_refresh():
-    """Refresh the correlation matrix every 5 minutes."""
+    """Background correlation engine — refreshes every 30 seconds.
+
+    Improvements over the original 5-minute cycle:
+    - Runs every 30s instead of 5 min for near-real-time risk awareness
+    - Tracks top candidate symbols (not just open positions)
+    - Detects correlation regime shifts and logs warnings
+    - Caches results in Redis for other services to consume
+    """
     global _last_correlation_matrix
+    _prev_avg_corr: Optional[float] = None
+
     while True:
         try:
             open_positions = await _get_open_positions()
             symbols = list(open_positions.keys())
+
+            # Also include top trading pairs for pre-computed correlation
+            try:
+                top_pairs_raw = await redis_client.get("top_trading_pairs")
+                if top_pairs_raw:
+                    import json as _json
+                    top_pairs = _json.loads(top_pairs_raw)
+                    for pair in top_pairs[:20]:  # Top 20 candidates
+                        if pair not in symbols:
+                            symbols.append(pair)
+            except Exception:
+                pass
+
+            # Need at least 2 symbols for correlation
             if len(symbols) >= 2:
                 candle_data = await db.fetch_candles_multi(symbols, timeframe="1m", limit=200)
                 _last_correlation_matrix = compute_correlation_matrix(symbols, candle_data)
-                logger.debug("Correlation matrix refreshed", n_symbols=len(symbols))
+
+                # Detect correlation regime shifts
+                if _last_correlation_matrix:
+                    corr_values = []
+                    for sym_a, row in _last_correlation_matrix.items():
+                        for sym_b, val in row.items():
+                            if sym_a != sym_b and isinstance(val, (int, float)):
+                                corr_values.append(abs(val))
+
+                    if corr_values:
+                        avg_corr = sum(corr_values) / len(corr_values)
+                        if _prev_avg_corr is not None:
+                            delta = avg_corr - _prev_avg_corr
+                            if delta > 0.15:
+                                logger.warning(
+                                    "Correlation regime shift detected — correlations rising",
+                                    avg_correlation=round(avg_corr, 3),
+                                    delta=round(delta, 3),
+                                    n_symbols=len(symbols),
+                                )
+                            elif avg_corr > 0.7:
+                                logger.warning(
+                                    "High correlation regime — risk of concentrated portfolio",
+                                    avg_correlation=round(avg_corr, 3),
+                                )
+                        _prev_avg_corr = avg_corr
+
+                    # Cache in Redis for other services
+                    try:
+                        await redis_client.set(
+                            "correlation_matrix",
+                            json.dumps(_last_correlation_matrix),
+                            ex=120,  # 2-minute TTL
+                        )
+                    except Exception:
+                        pass
+
+                logger.debug("Correlation matrix refreshed",
+                             n_symbols=len(symbols),
+                             open_positions=len(open_positions))
+
         except Exception as e:
             logger.error("Correlation refresh failed", error=str(e))
-        await asyncio.sleep(300)  # every 5 min
+
+        await asyncio.sleep(30)  # Every 30 seconds (was 300)
 
 
 # ---------------------------------------------------------------------------

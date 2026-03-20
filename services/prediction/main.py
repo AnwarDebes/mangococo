@@ -32,7 +32,7 @@ from pydantic import BaseModel
 from features.technical import compute_technical_features, compute_features_matrix
 from features.sentiment import fetch_sentiment_features
 from features.onchain import fetch_onchain_features
-from models.tcn_model import TCNModel
+from models.tcn_model import TCNModel, MultiTCNEnsemble
 from models.xgboost_model import XGBoostModel
 from models.ensemble import EnsembleCombiner, EnsemblePrediction, ModelPrediction
 from models.model_registry import ModelRegistry
@@ -115,6 +115,7 @@ class HealthResponse(BaseModel):
 redis_client: Optional[aioredis.Redis] = None
 tcn_model: Optional[TCNModel] = None
 xgb_model: Optional[XGBoostModel] = None
+multi_tcn: Optional[MultiTCNEnsemble] = None
 ensemble = EnsembleCombiner()
 registry: Optional[ModelRegistry] = None
 price_history: Dict[str, List[dict]] = {}
@@ -122,8 +123,10 @@ latest_predictions: Dict[str, PredictionResponse] = {}
 
 
 def _ml_mode_available() -> bool:
-    return (tcn_model is not None and tcn_model.is_loaded) or (
-        xgb_model is not None and xgb_model.is_loaded
+    return (
+        (tcn_model is not None and tcn_model.is_loaded)
+        or (multi_tcn is not None and multi_tcn.is_loaded)
+        or (xgb_model is not None and xgb_model.is_loaded)
     )
 
 
@@ -133,11 +136,11 @@ def _ml_mode_available() -> bool:
 
 def load_models() -> None:
     """Attempt to load latest TCN and XGBoost models from the registry."""
-    global tcn_model, xgb_model, registry
+    global tcn_model, xgb_model, multi_tcn, registry
 
     registry = ModelRegistry(registry_dir=MODEL_DIR)
 
-    # TCN
+    # TCN (primary — kept for backwards compatibility)
     tcn_info = registry.get_latest("tcn")
     if tcn_info and os.path.isfile(tcn_info.path):
         try:
@@ -149,6 +152,15 @@ def load_models() -> None:
             tcn_model = None
     else:
         logger.info("No TCN model in registry, ML-TCN will be unavailable")
+
+    # Multi-timeframe TCN ensemble (loads variant-specific or falls back to primary)
+    multi_tcn = MultiTCNEnsemble()
+    multi_tcn.initialize_variants(MODEL_DIR)
+    if multi_tcn.is_loaded:
+        logger.info("Multi-TCN ensemble ready",
+                     variants_loaded=sum(1 for m in multi_tcn.models.values() if m.is_loaded))
+    else:
+        logger.info("Multi-TCN ensemble has no loaded models, will use single TCN fallback")
 
     # XGBoost
     xgb_info = registry.get_latest("xgboost")
@@ -251,24 +263,29 @@ def _safe_float(v, default=0.0):
 
 
 def _prepare_symbol_features(symbol: str, ticks_snapshot: List[dict]) -> Optional[dict]:
-    """CPU-bound: build DataFrame, compute technical features and TCN sequence for one symbol.
+    """CPU-bound: build DataFrame, compute technical features and full feature matrix.
 
     Runs in thread pool. Returns prepared data for batched GPU inference.
-    Uses vectorized feature computation — one pass over the DataFrame, not 60.
+    Uses vectorized feature computation — one pass over the DataFrame.
+    The full feature matrix is kept so multi-TCN variants can slice their
+    own sequence lengths (15, 30, 60, 120 timesteps).
     """
-    df = pd.DataFrame(ticks_snapshot[-120:])
+    # Use more history to support long-horizon TCN variants (120+ timesteps)
+    df = pd.DataFrame(ticks_snapshot[-250:])
     for col in ("open", "high", "low", "close", "volume"):
         if col not in df.columns:
             df[col] = df.get("price", 0)
 
     tech_features = compute_technical_features(df)
 
-    # Build TCN sequence using vectorized feature computation (single pass)
+    # Build full feature matrix — each TCN variant slices what it needs
+    feat_matrix = None
     tcn_sequence = None
-    if len(df) >= 60:
+    if len(df) >= 15:  # Minimum for smallest variant (tcn_micro)
         try:
-            feat_matrix = compute_features_matrix(df)  # (N, 20) — one call
-            tcn_sequence = feat_matrix[-60:]  # last 60 rows
+            feat_matrix = compute_features_matrix(df)  # (N, 20)
+            if len(feat_matrix) >= 60:
+                tcn_sequence = feat_matrix[-60:]  # Primary TCN sequence for backwards compat
         except Exception:
             pass
 
@@ -277,6 +294,7 @@ def _prepare_symbol_features(symbol: str, ticks_snapshot: List[dict]) -> Optiona
         "df": df,
         "tech_features": tech_features,
         "tcn_sequence": tcn_sequence,
+        "feat_matrix": feat_matrix,
     }
 
 
@@ -331,7 +349,7 @@ async def seed_price_history_from_db():
                 try:
                     tick_rows = await conn.fetch(
                         """SELECT time, price, volume FROM ticks
-                           WHERE symbol = $1 ORDER BY time DESC LIMIT 120""",
+                           WHERE symbol = $1 ORDER BY time DESC LIMIT 500""",
                         symbol
                     )
                     if tick_rows and len(tick_rows) >= 60:
@@ -363,7 +381,7 @@ async def seed_price_history_from_db():
                         rows = await conn.fetch(
                             """SELECT time, open, high, low, close, volume
                                FROM candles WHERE symbol = $1 AND timeframe = '5m'
-                               ORDER BY time DESC LIMIT 120""",
+                               ORDER BY time DESC LIMIT 500""",
                             symbol
                         )
                         if rows and len(rows) >= 20:
@@ -435,9 +453,9 @@ async def collect_market_data():
                         if symbol not in price_history:
                             price_history[symbol] = []
                         price_history[symbol].append(data_point)
-                        # Keep last 200 ticks
-                        if len(price_history[symbol]) > 500:
-                            price_history[symbol] = price_history[symbol][-500:]
+                        # Keep last 10,000 ticks (RAM is plentiful — supports longer sequences)
+                        if len(price_history[symbol]) > 10000:
+                            price_history[symbol] = price_history[symbol][-10000:]
                     except Exception as exc:
                         logger.debug("Tick parse error", error=str(exc))
                 else:
@@ -598,9 +616,40 @@ async def prediction_loop():
                 logger.debug("Phase 1+ext done")
 
                 # ── Phase 2: Batched GPU inference ────────────────────────
-                # TCN batch
+                # Multi-TCN ensemble batch inference
+                multi_tcn_results: Dict[str, list] = {}  # symbol -> [(variant, direction, confidence)]
                 tcn_results = {}
-                if tcn_model is not None and tcn_model.is_loaded:
+
+                if multi_tcn is not None and multi_tcn.is_loaded:
+                    # Collect feature matrices for all prepared symbols
+                    feat_matrices = {}
+                    for sym, prep in prepared.items():
+                        if prep.get("feat_matrix") is not None:
+                            feat_matrices[sym] = prep["feat_matrix"]
+
+                    if feat_matrices:
+                        try:
+                            multi_tcn_results = await asyncio.wait_for(
+                                asyncio.to_thread(multi_tcn.predict_batch_all, feat_matrices),
+                                timeout=15.0,
+                            )
+                            # Also populate tcn_results from primary variant for backwards compat
+                            for sym, variant_preds in multi_tcn_results.items():
+                                medium_preds = [p for p in variant_preds if p[0] == "tcn_medium"]
+                                if medium_preds:
+                                    _, direction, confidence = medium_preds[0]
+                                    tcn_results[sym] = ModelPrediction(direction=direction, confidence=confidence)
+                                elif variant_preds:
+                                    # Use first available variant
+                                    _, direction, confidence = variant_preds[0]
+                                    tcn_results[sym] = ModelPrediction(direction=direction, confidence=confidence)
+                        except asyncio.TimeoutError:
+                            logger.warning("Multi-TCN batch inference timed out", symbols=len(feat_matrices))
+                        except Exception as exc:
+                            logger.warning("Multi-TCN batch inference failed", error=str(exc))
+
+                # Fallback to single TCN if multi-TCN didn't produce results
+                if not tcn_results and tcn_model is not None and tcn_model.is_loaded:
                     tcn_syms = []
                     tcn_seqs = []
                     for sym, prep in prepared.items():
@@ -663,10 +712,14 @@ async def prediction_loop():
                     sentiment_avail = sf.get("_source", "default") != "default"
                     onchain_avail = of.get("_source", "default") != "default"
 
+                    # Multi-TCN variant predictions for this symbol
+                    sym_multi_tcn = multi_tcn_results.get(sym)
+
                     result = ensemble.combine(
                         tcn_pred=tcn_pred, xgb_pred=xgb_pred,
                         sentiment_score=sentiment_score, onchain_score=onchain_score,
                         sentiment_available=sentiment_avail, onchain_available=onchain_avail,
+                        multi_tcn_preds=sym_multi_tcn if sym_multi_tcn else None,
                     )
 
                     PREDICTIONS_TOTAL.labels(symbol=sym, direction=result.direction).inc()

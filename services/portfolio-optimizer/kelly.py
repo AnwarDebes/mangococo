@@ -12,7 +12,7 @@ import structlog
 logger = structlog.get_logger()
 
 # Caps
-MAX_POSITION_PCT = float(os.getenv("PORTFOLIO_MAX_POSITION_PCT", 0.05))
+MAX_POSITION_PCT = float(os.getenv("PORTFOLIO_MAX_POSITION_PCT", 0.15))  # Dynamic sizing handles the real cap
 MIN_POSITION_USD = 5.0
 
 

@@ -1,8 +1,15 @@
 """
-Smart Adaptive Stop-Loss System (v1.0)
+Smart Adaptive Stop-Loss System (v2.0)
 
 Multi-factor dynamic stop that adapts to market conditions in real-time.
 Combines research from quantitative finance and crypto-specific studies.
+
+v2.0 changes:
+  - Dynamic min stop and trailing activation based on ATR (per-token volatility)
+  - Removed young position penalty (was causing instant stopouts)
+  - Multiplier compounding capped at 0.5 floor
+  - Hard floor tightened to 5% to cut losers faster
+  - ATR multiplier widened to 3x for more breathing room
 
 Architecture (6 layers):
   1. Regime Detection    — master switch for all parameters
@@ -38,8 +45,7 @@ class SmartStopResult:
 # ── Configuration ─────────────────────────────────────────────────────
 
 # Chandelier Exit: stop = peak_price - (ATR_MULT * ATR)
-# We express this as a percentage of entry price for simplicity
-ATR_STOP_MULT = 2.5              # Base: 2.5x ATR from peak
+ATR_STOP_MULT = 3.0              # Base: 3x ATR from peak (was 2.5)
 
 # Regime multipliers (scales the ATR stop distance)
 REGIME_STOP_MULTS = {
@@ -51,17 +57,15 @@ REGIME_STOP_MULTS = {
 }
 
 # Hard floor: absolute maximum loss regardless of other factors
-# This is the "never lose more than X%" safety net
-HARD_FLOOR_LOSS_PCT = 0.07       # -7% absolute max loss
+HARD_FLOOR_LOSS_PCT = 0.05       # -5% absolute max loss (was 7%)
 
-# Minimum stop distance (don't stop too tight or every tick triggers)
-MIN_STOP_PCT = 0.008             # 0.8% minimum stop distance
+# Minimum stop: dynamic — at least 1.5x ATR, with a 2% absolute floor
+MIN_STOP_FLOOR = 0.04            # 4% absolute minimum
+MIN_STOP_ATR_MULT = 1.5          # min stop = 1.5x ATR (so volatile coins get wider min)
 
-# Time-based adjustment: new positions get tighter stops
-# Positions older than this get the full calculated stop
-POSITION_AGE_FULL_STOP_MINUTES = 5.0
-# Young positions (< age threshold) use this fraction of calculated stop
-YOUNG_POSITION_STOP_FRACTION = 0.6
+# Trailing activation: dynamic — at least 1.2x ATR profit before trailing arms
+TRAIL_ACTIVATION_FLOOR = 0.015   # 1.5% absolute minimum to activate
+TRAIL_ACTIVATION_ATR_MULT = 1.2  # activate trailing after 1.2x ATR profit
 
 
 def compute_smart_stop(
@@ -98,6 +102,12 @@ def compute_smart_stop(
     atr_decimal = max(atr_pct / 100, 0.001)  # floor at 0.1%
     base_atr_stop = ATR_STOP_MULT * atr_decimal
 
+    # Dynamic minimum stop: scales with volatility
+    min_stop_pct = max(MIN_STOP_FLOOR, MIN_STOP_ATR_MULT * atr_decimal)
+
+    # Dynamic trailing activation: scales with volatility
+    trail_activation_pct = max(TRAIL_ACTIVATION_FLOOR, TRAIL_ACTIVATION_ATR_MULT * atr_decimal)
+
     # ══════════════════════════════════════════════════════════════════
     # LAYER 2: Regime Multiplier
     # ══════════════════════════════════════════════════════════════════
@@ -106,28 +116,21 @@ def compute_smart_stop(
     # ══════════════════════════════════════════════════════════════════
     # LAYER 3: Momentum Assessment
     # ══════════════════════════════════════════════════════════════════
-    # If momentum is still positive despite price dipping, the dip is
-    # likely temporary → widen stop. If momentum is negative, the dip
-    # is likely real → tighten stop.
     momentum_mult = 1.0
 
     if side == "long":
-        # Count how many momentum timeframes are positive
         mom_signals = [momentum_5m, momentum_15m, momentum_30m]
         positive_count = sum(1 for m in mom_signals if m > 0)
 
         if positive_count >= 2:
-            # Majority of timeframes positive → dip is noise, widen stop
             momentum_mult = 1.2
         elif positive_count == 0:
-            # All negative → real selling, tighten
             momentum_mult = 0.7
 
-        # RSI modifier: oversold during dip = likely bounce
         if rsi_14 < 30:
-            momentum_mult *= 1.15  # Oversold: give room for bounce
+            momentum_mult *= 1.15
         elif rsi_14 > 70:
-            momentum_mult *= 0.8   # Overbought: tighten, likely to reverse
+            momentum_mult *= 0.8
 
     else:  # short
         mom_signals = [momentum_5m, momentum_15m, momentum_30m]
@@ -146,43 +149,35 @@ def compute_smart_stop(
     # ══════════════════════════════════════════════════════════════════
     # LAYER 4: Volume Confirmation
     # ══════════════════════════════════════════════════════════════════
-    # High volume during a price drop = institutional selling, real move
-    # Low volume during a price drop = retail noise, likely to reverse
     volume_mult = 1.0
 
     if pnl_pct < 0:  # Position is currently losing
         if volume_ratio > 2.0:
-            # Volume 2x+ above average during loss → real selling, tighten
             volume_mult = 0.7
         elif volume_ratio > 1.5:
             volume_mult = 0.85
         elif volume_ratio < 0.5:
-            # Very low volume → probably noise, give room
             volume_mult = 1.2
     elif pnl_pct > 0 and volume_ratio > 1.5:
-        # Profitable + high volume = strong move, let it run
         volume_mult = 1.15
 
     # ══════════════════════════════════════════════════════════════════
     # LAYER 5: Trend Health (EMA + MACD)
     # ══════════════════════════════════════════════════════════════════
-    # If EMAs are still bullish and MACD supports, trend is intact
     trend_mult = 1.0
 
     if side == "long":
         trend_score = 0
-        if ema_cross_9_21 > 0:  # Short-term bullish
+        if ema_cross_9_21 > 0:
             trend_score += 1
-        if ema_cross_25_50 > 0:  # Medium-term bullish
+        if ema_cross_25_50 > 0:
             trend_score += 1
-        if macd_histogram > 0:   # MACD bullish
+        if macd_histogram > 0:
             trend_score += 1
 
         if trend_score == 3:
-            # All trend signals bullish → strong trend, widen stop
             trend_mult = 1.25
         elif trend_score == 0:
-            # All bearish → trend broken, tighten hard
             trend_mult = 0.6
         elif trend_score == 1:
             trend_mult = 0.85
@@ -205,44 +200,32 @@ def compute_smart_stop(
     # ══════════════════════════════════════════════════════════════════
     # LAYER 6: AI Prediction Integration
     # ══════════════════════════════════════════════════════════════════
-    # If AI exit pressure is building (AI says sell), tighten stop
-    # If AI pressure is low (AI says hold), widen stop
     ai_mult = 1.0
 
     if ai_threshold > 0:
         pressure_ratio = ai_pressure / ai_threshold
         if pressure_ratio > 0.7:
-            # AI is close to triggering exit → tighten stop
             ai_mult = 0.7
         elif pressure_ratio > 0.4:
             ai_mult = 0.85
         elif pressure_ratio < 0.15:
-            # AI very calm → widen stop, let position breathe
             ai_mult = 1.2
 
     # ══════════════════════════════════════════════════════════════════
     # COMBINE: Final stop distance
     # ══════════════════════════════════════════════════════════════════
-    raw_stop = base_atr_stop * regime_mult * momentum_mult * volume_mult * trend_mult * ai_mult
+    combined_mult = regime_mult * momentum_mult * volume_mult * trend_mult * ai_mult
+    combined_mult = max(combined_mult, 0.5)  # Cap compounding — never crush stop below 50%
+    raw_stop = base_atr_stop * combined_mult
 
-    # Time-based adjustment: new positions get tighter stops
-    if hold_time_minutes < POSITION_AGE_FULL_STOP_MINUTES:
-        age_factor = YOUNG_POSITION_STOP_FRACTION + (
-            (1.0 - YOUNG_POSITION_STOP_FRACTION) *
-            (hold_time_minutes / POSITION_AGE_FULL_STOP_MINUTES)
-        )
-        raw_stop *= age_factor
-
-    # Apply floors and ceilings
-    stop_distance = max(raw_stop, MIN_STOP_PCT)
+    # Apply dynamic floor and hard ceiling
+    stop_distance = max(raw_stop, min_stop_pct)
     stop_distance = min(stop_distance, HARD_FLOOR_LOSS_PCT)
 
     # Determine if we should exit
-    # For longs: exit if price dropped from peak by more than stop_distance
-    # For shorts: exit if price rose from peak by more than stop_distance
     drop_from_peak = peak_pnl_pct - pnl_pct if peak_pnl_pct > 0 else 0
     hard_floor_breached = pnl_pct <= -HARD_FLOOR_LOSS_PCT
-    trailing_breached = (peak_pnl_pct >= 0.01) and (drop_from_peak >= stop_distance)
+    trailing_breached = (peak_pnl_pct >= trail_activation_pct) and (drop_from_peak >= stop_distance)
 
     should_exit = hard_floor_breached or trailing_breached
 

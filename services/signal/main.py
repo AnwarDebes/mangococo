@@ -264,6 +264,21 @@ async def generate_signal(prediction: dict) -> Optional[Signal]:
                      trend_strength=regime.trend_strength)
         return None
 
+    # ── Fetch Fear & Greed Index for contrarian sizing ─────────────
+    fear_greed_index = 50.0  # default: neutral
+    try:
+        fg_raw = await redis_client.get("fear_greed_index")
+        if fg_raw:
+            fg_data = json.loads(fg_raw) if fg_raw.startswith("{") else {"value": float(fg_raw)}
+            fear_greed_index = float(fg_data.get("value", fg_data.get("normalized_score", 50.0)))
+            # If we got the normalized_score (-1 to 1), convert back to 0-100
+            if -1.0 <= fear_greed_index <= 1.0 and fear_greed_index != 50.0:
+                fear_greed_index = (fear_greed_index + 1.0) * 50.0
+    except Exception:
+        pass
+    # Inject into features so edge_gate can use it
+    features["fear_greed_index"] = fear_greed_index
+
     # ══════════════════════════════════════════════════════════════════
     # LAYER B: Edge Gate
     # ══════════════════════════════════════════════════════════════════
@@ -286,7 +301,7 @@ async def generate_signal(prediction: dict) -> Optional[Signal]:
         edge = None  # sell signals pass through (exit managed by position manager)
 
     # ══════════════════════════════════════════════════════════════════
-    # LAYER C: Volatility-Targeted Sizing
+    # LAYER C: Dynamic Adaptive Sizing
     # ══════════════════════════════════════════════════════════════════
     if action == "buy":
         available = await _get_available_capital()
@@ -299,6 +314,32 @@ async def generate_signal(prediction: dict) -> Optional[Signal]:
         atr_pct = features.get("atr_pct", 0.5)
         open_risk = await _get_open_risk()
 
+        # Fetch portfolio performance data for dynamic sizing
+        starting_capital_val = STARTING_CAPITAL
+        current_drawdown = 0.0
+        recent_win_rate = 0.5
+        recent_n_trades = 0
+        try:
+            ps_raw = await redis_client.get("portfolio_state")
+            if ps_raw:
+                ps = json.loads(ps_raw)
+                sc = float(ps.get("starting_capital", STARTING_CAPITAL))
+                if sc > 0:
+                    starting_capital_val = sc
+                    current_drawdown = max(0.0, (sc - portfolio_value) / sc)
+        except Exception:
+            pass
+
+        # Fetch recent trade performance for streak factor
+        try:
+            recent_trades = await redis_client.lrange("trade_history", 0, 19)
+            if recent_trades:
+                wins = sum(1 for t in recent_trades if float(json.loads(t).get("pnl", 0)) > 0)
+                recent_n_trades = len(recent_trades)
+                recent_win_rate = wins / recent_n_trades if recent_n_trades > 0 else 0.5
+        except Exception:
+            pass
+
         sizing = calculate_vol_targeted_size(
             portfolio_value=portfolio_value,
             current_price=current_price,
@@ -307,6 +348,11 @@ async def generate_signal(prediction: dict) -> Optional[Signal]:
             regime=regime,
             edge_multiplier=edge.size_multiplier if edge else 1.0,
             open_risk_usd=open_risk,
+            fear_greed_index=fear_greed_index,
+            starting_capital=starting_capital_val,
+            current_drawdown=current_drawdown,
+            recent_win_rate=recent_win_rate,
+            recent_n_trades=recent_n_trades,
         )
 
         if sizing.skip:
@@ -322,12 +368,17 @@ async def generate_signal(prediction: dict) -> Optional[Signal]:
             SIGNALS_SKIPPED.labels(reason="insufficient_after_sizing").inc()
             return None
 
-        logger.info("Vol-targeted size calculated",
+        logger.info("Dynamic size calculated",
                      symbol=symbol, position_usd=round(amount, 2),
                      risk_usd=sizing.risk_usd, atr_pct=atr_pct,
-                     vol_ratio=sizing.vol_ratio,
+                     dynamic_risk_pct=sizing.details.get("dynamic_risk_pct"),
+                     dynamic_cap_pct=sizing.details.get("dynamic_cap_pct"),
                      regime_mult=sizing.regime_multiplier,
-                     edge_mult=sizing.edge_multiplier)
+                     edge_mult=sizing.edge_multiplier,
+                     fear_greed=round(fear_greed_index, 0),
+                     fg_mult=sizing.details.get("fear_greed_multiplier", 1.0),
+                     streak_mult=sizing.details.get("streak_multiplier", 1.0),
+                     dd_scale=sizing.details.get("drawdown_scale", 1.0))
     else:
         # Sell: use position amount
         amount = current_positions[symbol].amount
