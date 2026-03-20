@@ -24,9 +24,12 @@ export default function PortfolioCard({
   }
 
   const pnlPositive = portfolio.daily_pnl >= 0;
+  // Derive starting value so the percentage reflects how much we're up/down
+  // from the original capital, not relative to the current (already changed) value.
+  const startingValue = portfolio.total_value - portfolio.daily_pnl;
   const pnlPercent =
-    portfolio.total_value > 0
-      ? (portfolio.daily_pnl / portfolio.total_value) * 100
+    startingValue > 0
+      ? (portfolio.daily_pnl / startingValue) * 100
       : 0;
 
   return (

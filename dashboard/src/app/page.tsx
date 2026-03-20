@@ -68,24 +68,18 @@ export default function DashboardPage() {
   const portfolio: PortfolioState | undefined = useMemo(() => {
     if (!rawPortfolio) return undefined;
 
-    // Compute positions value from the actual positions array
-    const computedPositionsValue = positions
-      ? positions.reduce((sum, p) => sum + p.current_price * p.amount, 0)
-      : rawPortfolio.positions_value;
-
-    // Cash balance comes from the portfolio API (executor/risk service)
+    // Use the API's total_value directly (computed by the paper executor
+    // from actual balances + current prices).  Recalculating from the
+    // positions array can diverge when the position service is out of sync.
+    const totalValue = rawPortfolio.total_value;
     const cashBalance = rawPortfolio.cash_balance;
-
-    // Total value = cash + positions (ensures the equation always holds)
-    const totalValue = cashBalance + computedPositionsValue;
-
-    // Open positions count from the actual array
+    const positionsValue = totalValue - cashBalance > 0 ? totalValue - cashBalance : 0;
     const openPositions = positions ? positions.length : rawPortfolio.open_positions;
 
     return {
       total_value: totalValue,
       cash_balance: cashBalance,
-      positions_value: computedPositionsValue,
+      positions_value: positionsValue,
       daily_pnl: rawPortfolio.daily_pnl,
       open_positions: openPositions,
     };
