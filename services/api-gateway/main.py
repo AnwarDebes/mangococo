@@ -196,6 +196,84 @@ async def trade_event_snapshot_listener():
         backoff = min(backoff * 2, 30)
 
 
+async def service_event_bridge():
+    """Bridge service pub/sub events into AI activity logs for the dashboard."""
+    bridge_pubsub = redis_client.pubsub()
+    await bridge_pubsub.subscribe(
+        "raw_signals", "validated_signals", "sized_signals",
+        "filled_orders", "position_opened", "position_closed",
+    )
+    logger.info("AI log bridge subscribed to service channels")
+
+    async for message in bridge_pubsub.listen():
+        if message["type"] != "message":
+            continue
+        try:
+            channel = message["channel"]
+            data = json.loads(message["data"])
+            symbol = data.get("symbol", "")
+
+            if channel == "raw_signals":
+                action = data.get("action", "unknown")
+                reason = data.get("reason", "")
+                if reason:
+                    msg = f"{action.upper()} signal — {reason}"
+                else:
+                    msg = f"{action.upper()} signal generated"
+                await log_ai_activity(
+                    category=AILogCategory.SIGNAL, action=msg,
+                    level=AILogLevel.INFO, symbol=symbol,
+                    confidence=float(data.get("confidence", 0)),
+                    chain_id=data.get("signal_id", ""),
+                    details={"amount": data.get("amount"), "price": data.get("price"), "reason": reason},
+                )
+
+            elif channel == "validated_signals":
+                await log_ai_activity(
+                    category=AILogCategory.RISK, action="Signal approved by risk manager",
+                    level=AILogLevel.INFO, symbol=symbol,
+                    chain_id=data.get("signal_id", ""),
+                    details={"amount": data.get("amount")},
+                )
+
+            elif channel == "filled_orders":
+                side = data.get("side", "")
+                price = data.get("price", 0)
+                cost = data.get("cost", 0)
+                reason = data.get("reason", "")
+                msg = f"{'BUY' if side == 'buy' else 'SELL'} executed — ${cost:.2f}"
+                if reason:
+                    msg += f" ({reason})"
+                await log_ai_activity(
+                    category=AILogCategory.TRADE, action=msg,
+                    level=AILogLevel.INFO, symbol=symbol,
+                    chain_id=data.get("signal_id", ""),
+                    details={"side": side, "price": price, "cost": cost, "filled": data.get("filled"), "reason": reason},
+                )
+
+            elif channel == "position_opened":
+                price = data.get("price", 0)
+                amount = data.get("amount", 0)
+                await log_ai_activity(
+                    category=AILogCategory.PORTFOLIO, action=f"Position opened — {data.get('side', 'long').upper()}",
+                    level=AILogLevel.INFO, symbol=symbol,
+                    details={"side": data.get("side"), "amount": amount, "price": price},
+                )
+
+            elif channel == "position_closed":
+                pnl = data.get("pnl", 0)
+                level = AILogLevel.INFO if pnl >= 0 else AILogLevel.WARNING
+                await log_ai_activity(
+                    category=AILogCategory.PORTFOLIO,
+                    action=f"Position closed — PnL ${pnl:+.2f}",
+                    level=level, symbol=symbol,
+                    details={"pnl": pnl, "total_pnl": data.get("total_pnl", 0)},
+                )
+
+        except Exception as e:
+            logger.debug("Bridge event parse error", error=str(e))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global redis_client, http_client
@@ -223,11 +301,12 @@ async def lifespan(app: FastAPI):
     summary_task = asyncio.create_task(periodic_ai_summary())
     snapshot_task = asyncio.create_task(periodic_portfolio_snapshot())
     trade_snapshot_task = asyncio.create_task(trade_event_snapshot_listener())
+    bridge_task = asyncio.create_task(service_event_bridge())
 
     yield
 
     # Cancel background tasks
-    for task in (summary_task, snapshot_task, trade_snapshot_task):
+    for task in (summary_task, snapshot_task, trade_snapshot_task, bridge_task):
         task.cancel()
         try:
             await task
@@ -1208,24 +1287,42 @@ async def get_resources():
 
         resources = []
 
-        # ── Map supervisor program names to service names and PIDs ──
+        # ── Map service names to PIDs from PID files or supervisorctl ──
         svc_pid_map = {}
-        try:
-            result = subprocess.run(
-                ["supervisorctl", "status"], capture_output=True, text=True, timeout=5,
-            )
-            for line in result.stdout.strip().splitlines():
-                parts = line.split()
-                if len(parts) >= 4 and parts[1] == "RUNNING":
-                    raw_name = parts[0].split(":")[-1]
-                    svc_name = raw_name.replace("goblin-", "").replace("-", "_")
-                    pid_str = parts[3].rstrip(",")
-                    try:
-                        svc_pid_map[svc_name] = int(pid_str)
-                    except ValueError:
-                        pass
-        except Exception:
-            pass
+        logs_dir = os.path.join(os.getenv("ROOT", "/home/coder/Goblin"), "logs")
+
+        # Method 1: PID files from goblin_start.sh
+        if os.path.isdir(logs_dir):
+            import glob
+            for pidfile in glob.glob(os.path.join(logs_dir, "*.pid")):
+                try:
+                    name = os.path.basename(pidfile).replace(".pid", "").replace("-", "_")
+                    with open(pidfile) as f:
+                        pid = int(f.read().strip())
+                    # Verify process is alive
+                    if psutil.pid_exists(pid):
+                        svc_pid_map[name] = pid
+                except (ValueError, IOError):
+                    pass
+
+        # Method 2: Fallback to supervisorctl if no PID files found
+        if not svc_pid_map:
+            try:
+                result = subprocess.run(
+                    ["supervisorctl", "status"], capture_output=True, text=True, timeout=5,
+                )
+                for line in result.stdout.strip().splitlines():
+                    parts = line.split()
+                    if len(parts) >= 4 and parts[1] == "RUNNING":
+                        raw_name = parts[0].split(":")[-1]
+                        svc_name = raw_name.replace("goblin-", "").replace("-", "_")
+                        pid_str = parts[3].rstrip(",")
+                        try:
+                            svc_pid_map[svc_name] = int(pid_str)
+                        except ValueError:
+                            pass
+            except Exception:
+                pass
 
         # ── System totals ──
         cpu_count = psutil.cpu_count(logical=True) or 96
