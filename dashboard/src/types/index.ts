@@ -5,9 +5,11 @@ export interface Position {
   current_price: number;
   amount: number;
   unrealized_pnl: number;
-  stop_loss_price?: number;  // Legacy — AI controls exits, no longer set by position manager
-  take_profit_price?: number;  // Legacy — AI controls exits, no longer set by position manager
+  stop_loss_price?: number;
+  take_profit_price?: number;
   opened_at: string;
+  peak_pnl_pct?: number;
+  trailing_active?: boolean;
 }
 
 export interface Trade {

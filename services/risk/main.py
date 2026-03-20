@@ -67,7 +67,11 @@ portfolio = Portfolio()
 async def validate_signal(signal: Signal) -> tuple[bool, str, float]:
     global portfolio
 
-    # Check daily loss limit
+    # Sells (position closes) bypass ALL risk limits — they must execute in full
+    if signal.action == "sell":
+        return True, "approved", signal.amount
+
+    # Check daily loss limit (buys only)
     if portfolio.daily_pnl <= -(STARTING_CAPITAL * MAX_DAILY_LOSS_PCT):
         return False, "daily_loss_limit_reached", 0
 
@@ -77,19 +81,15 @@ async def validate_signal(signal: Signal) -> tuple[bool, str, float]:
         if remaining_after < MIN_POSITION_USD * 0.5:
             return False, "insufficient_capital_for_new_positions", 0
 
-    # Check time between trades
+    # Check time between trades (buys only)
     if portfolio.last_trade_time:
         seconds_since = (datetime.utcnow() - datetime.fromisoformat(portfolio.last_trade_time)).total_seconds()
         if seconds_since < MIN_TIME_BETWEEN_TRADES:
             return False, f"too_soon_wait_{int(MIN_TIME_BETWEEN_TRADES - seconds_since)}s", 0
 
-    # Check position size
-    # For buys: signal.amount is USDT value (e.g. $1.50), not coin quantity
-    # For sells: signal.amount is coin quantity
-    if signal.action == "buy":
-        trade_value = signal.amount  # Already in USDT
-    else:
-        trade_value = signal.amount * signal.price
+    # Check position size (buys only)
+    # signal.amount is USDT value (e.g. $1.50) for buys
+    trade_value = signal.amount
 
     max_position = portfolio.available_capital * MAX_POSITION_PCT
 
@@ -98,14 +98,9 @@ async def validate_signal(signal: Signal) -> tuple[bool, str, float]:
 
     adjusted_amount = signal.amount
     if trade_value > max_position:
-        if signal.action == "buy":
-            adjusted_amount = max_position  # Cap USDT amount
-        else:
-            adjusted_amount = max_position / signal.price
+        adjusted_amount = max_position  # Cap USDT amount
 
-    if signal.action == "buy" and adjusted_amount > portfolio.available_capital:
-        return False, "insufficient_capital", 0
-    elif signal.action == "sell" and adjusted_amount * signal.price > portfolio.available_capital:
+    if adjusted_amount > portfolio.available_capital:
         return False, "insufficient_capital", 0
 
     return True, "approved", adjusted_amount

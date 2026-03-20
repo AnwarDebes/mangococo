@@ -22,7 +22,10 @@ with a principled volatility-targeting framework.
 from dataclasses import dataclass
 from typing import Dict, Optional
 
-from .regime import RegimeState
+try:
+    from regime import RegimeState
+except ImportError:
+    from strategy.regime import RegimeState
 
 
 @dataclass

@@ -6,5 +6,5 @@ structlog==24.1.0
 python-dotenv==1.0.0
 prometheus-client==0.19.0
 asyncpg==0.29.0
-numpy==1.26.3
+numpy==1.26.4
 pandas==2.1.4

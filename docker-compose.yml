@@ -6,11 +6,10 @@ services:
     image: redis:7-alpine
     container_name: mc-redis
     restart: unless-stopped
+    network_mode: host
     env_file: ./config/trading.env
     # AOF persistence enabled to preserve positions, portfolio state, and trade history across restarts
     command: redis-server --requirepass ${REDIS_PASSWORD} --save "" --appendonly yes --appendfsync everysec
-    ports:
-      - "6379:6379"
     volumes:
       - ./shared/redis-data:/data
     healthcheck:
@@ -23,12 +22,11 @@ services:
     image: timescale/timescaledb:latest-pg15
     container_name: mc-timescaledb
     restart: unless-stopped
+    network_mode: host
     environment:
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-    ports:
-      - "5432:5432"
     volumes:
       - ./shared/timescale-data:/var/lib/postgresql/data
       - ./config/init-db.sql:/docker-entrypoint-initdb.d/init.sql
@@ -45,13 +43,12 @@ services:
     build: ./services/market-data
     container_name: mc-market-data
     restart: unless-stopped
+    network_mode: host
     env_file: ./config/trading.env
     environment:
-      REDIS_HOST: redis
-      POSTGRES_HOST: timescaledb
+      REDIS_HOST: localhost
+      POSTGRES_HOST: localhost
       TRADING_PAIRS_FILE: /config/trading_pairs.txt
-    ports:
-      - "8001:8001"
     volumes:
       - ./config:/config
     depends_on:
@@ -64,12 +61,11 @@ services:
     build: ./services/feature-store
     container_name: mc-feature-store
     restart: unless-stopped
+    network_mode: host
     env_file: ./config/trading.env
     environment:
-      REDIS_HOST: redis
-      POSTGRES_HOST: timescaledb
-    ports:
-      - "8007:8007"
+      REDIS_HOST: localhost
+      POSTGRES_HOST: localhost
     depends_on:
       redis:
         condition: service_healthy
@@ -82,25 +78,17 @@ services:
     build: ./services/prediction
     container_name: mc-prediction
     restart: unless-stopped
+    network_mode: host
     env_file: ./config/trading.env
     environment:
-      REDIS_HOST: redis
-      FEATURE_STORE_URL: http://feature-store:8007
+      REDIS_HOST: localhost
+      FEATURE_STORE_URL: http://localhost:8007
       MODEL_DIR: /app/shared/models
       TRADING_PAIRS_FILE: /config/trading_pairs.txt
       NVIDIA_VISIBLE_DEVICES: all
-    ports:
-      - "8002:8002"
     volumes:
       - ./shared/models:/app/shared/models
       - ./config:/config:ro
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
     depends_on:
       redis:
         condition: service_healthy
@@ -113,12 +101,11 @@ services:
     build: ./services/signal
     container_name: mc-signal
     restart: unless-stopped
+    network_mode: host
     env_file: ./config/trading.env
     environment:
-      REDIS_HOST: redis
+      REDIS_HOST: localhost
       TRADING_PAIRS_FILE: /config/trading_pairs.txt
-    ports:
-      - "8003:8000"
     volumes:
       - ./config:/config:ro
     depends_on:
@@ -135,11 +122,10 @@ services:
     build: ./services/risk
     container_name: mc-risk
     restart: unless-stopped
+    network_mode: host
     env_file: ./config/trading.env
     environment:
-      REDIS_HOST: redis
-    ports:
-      - "8004:8000"
+      REDIS_HOST: localhost
     depends_on:
       redis:
         condition: service_healthy
@@ -148,12 +134,11 @@ services:
     build: ./services/portfolio-optimizer
     container_name: mc-portfolio-optimizer
     restart: unless-stopped
+    network_mode: host
     env_file: ./config/trading.env
     environment:
-      REDIS_HOST: redis
-      POSTGRES_HOST: timescaledb
-    ports:
-      - "8010:8010"
+      REDIS_HOST: localhost
+      POSTGRES_HOST: localhost
     depends_on:
       redis:
         condition: service_healthy
@@ -166,12 +151,11 @@ services:
     build: ./services/executor
     container_name: mc-executor
     restart: unless-stopped
+    network_mode: host
     env_file: ./config/trading.env
     environment:
-      REDIS_HOST: redis
+      REDIS_HOST: localhost
       SIGNAL_CHANNEL: sized_signals
-    ports:
-      - "8005:8005"
     depends_on:
       redis:
         condition: service_healthy
@@ -184,11 +168,10 @@ services:
     build: ./services/position
     container_name: mc-position
     restart: unless-stopped
+    network_mode: host
     env_file: ./config/trading.env
     environment:
-      REDIS_HOST: redis
-    ports:
-      - "8006:8000"
+      REDIS_HOST: localhost
     depends_on:
       redis:
         condition: service_healthy
@@ -204,12 +187,11 @@ services:
     build: ./services/sentiment-analysis
     container_name: mc-sentiment-analysis
     restart: unless-stopped
+    network_mode: host
     env_file: ./config/trading.env
     environment:
-      REDIS_HOST: redis
-      POSTGRES_HOST: timescaledb
-    ports:
-      - "8008:8008"
+      REDIS_HOST: localhost
+      POSTGRES_HOST: localhost
     depends_on:
       redis:
         condition: service_healthy
@@ -220,12 +202,11 @@ services:
     build: ./services/trend-analysis
     container_name: mc-trend-analysis
     restart: unless-stopped
+    network_mode: host
     env_file: ./config/trading.env
     environment:
-      REDIS_HOST: redis
-      POSTGRES_HOST: timescaledb
-    ports:
-      - "8009:8009"
+      REDIS_HOST: localhost
+      POSTGRES_HOST: localhost
     depends_on:
       redis:
         condition: service_healthy
@@ -241,12 +222,11 @@ services:
     build: ./services/backtesting
     container_name: mc-backtesting
     restart: unless-stopped
+    network_mode: host
     env_file: ./config/trading.env
     environment:
-      REDIS_HOST: redis
-      POSTGRES_HOST: timescaledb
-    ports:
-      - "8011:8011"
+      REDIS_HOST: localhost
+      POSTGRES_HOST: localhost
     depends_on:
       timescaledb:
         condition: service_healthy
@@ -255,14 +235,13 @@ services:
     build: ./services/api-gateway
     container_name: mc-api-gateway
     restart: unless-stopped
+    network_mode: host
     env_file: ./config/trading.env
     environment:
-      REDIS_HOST: redis
-      POSTGRES_HOST: timescaledb
+      REDIS_HOST: localhost
+      POSTGRES_HOST: localhost
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
-    ports:
-      - "8080:8000"
     depends_on:
       redis:
         condition: service_healthy
@@ -295,10 +274,9 @@ services:
     build: ./dashboard
     container_name: mc-dashboard
     restart: unless-stopped
+    network_mode: host
     environment:
       NEXT_PUBLIC_API_URL: http://localhost:8080
-    ports:
-      - "3000:3000"
     depends_on:
       api-gateway:
         condition: service_started

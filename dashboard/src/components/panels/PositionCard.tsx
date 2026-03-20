@@ -1,6 +1,6 @@
 "use client";
 
-import { ArrowUpRight, ArrowDownRight, Shield, Target } from "lucide-react";
+import { ArrowUpRight, ArrowDownRight, Shield, Target, TrendingUp } from "lucide-react";
 import {
   formatCurrency,
   formatPrice,
@@ -88,6 +88,14 @@ export default function PositionCard({ position }: PositionCardProps) {
       </div>
 
       <div className="mt-3 flex items-center gap-4 text-xs text-gray-500">
+        {position.trailing_active && (
+          <div className="flex items-center gap-1">
+            <TrendingUp size={12} className="text-yellow-400" />
+            <span className="text-yellow-400">
+              Trail active (peak {formatPercent(position.peak_pnl_pct ? position.peak_pnl_pct * 100 : 0)})
+            </span>
+          </div>
+        )}
         {position.stop_loss_price != null && position.stop_loss_price > 0 && (
           <div className="flex items-center gap-1">
             <Shield size={12} className="text-red-400" />

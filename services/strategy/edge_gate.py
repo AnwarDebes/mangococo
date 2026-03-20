@@ -20,7 +20,10 @@ The gate produces an EdgeDecision with:
 from dataclasses import dataclass, field
 from typing import Dict, List
 
-from .regime import RegimeState
+try:
+    from regime import RegimeState
+except ImportError:
+    from strategy.regime import RegimeState
 
 
 @dataclass

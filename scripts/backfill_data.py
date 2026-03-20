@@ -346,7 +346,7 @@ async def main():
             )
 
     await pool.close()
-    exchange.close()
+    await exchange.close()
 
     elapsed = time.time() - start_time
     print(f"\nBackfill complete in {elapsed:.1f}s ({completed}/{total_tasks} tasks)")

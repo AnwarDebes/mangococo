@@ -17,7 +17,10 @@ This module provides functions that the position manager calls to:
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-from .regime import RegimeState
+try:
+    from regime import RegimeState
+except ImportError:
+    from strategy.regime import RegimeState
 
 
 @dataclass
