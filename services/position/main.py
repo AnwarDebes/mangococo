@@ -232,7 +232,7 @@ async def handle_filled_order(order: dict):
                     "exit_reason": order.get("reason", "manual")
                 }
                 await redis_client.lpush("trade_history", json.dumps(trade_record))
-                await redis_client.ltrim("trade_history", 0, 999)  # Keep last 1000 trades
+                await redis_client.ltrim("trade_history", 0, 99_999)  # Keep last 100k trades
 
                 await redis_client.publish("position_closed", json.dumps({"symbol": symbol, "pnl": realized, "total_pnl": pos.realized_pnl}))
                 logger.info("Position closed", symbol=symbol, pnl=realized, total_pnl=pos.realized_pnl)
@@ -884,11 +884,14 @@ async def get_exit_explanations(limit: int = 20):
 
 
 @app.get("/trades")
-async def get_trades(limit: int = 50):
+async def get_trades(limit: int = 50, offset: int = 0):
     """Get trade history with P&L information"""
     try:
-        # Get trade history from Redis
-        trade_history = await redis_client.lrange("trade_history", 0, limit - 1)
+        # Get total count from Redis list
+        total = await redis_client.llen("trade_history")
+
+        # Get requested slice
+        trade_history = await redis_client.lrange("trade_history", offset, offset + limit - 1)
         trades = []
 
         for trade_json in trade_history:
@@ -898,7 +901,7 @@ async def get_trades(limit: int = 50):
             except:
                 continue
 
-        return {"trades": trades, "total": len(trades)}
+        return {"trades": trades, "total": total}
     except Exception as e:
         logger.error("Failed to get trade history", error=str(e))
         return {"trades": [], "total": 0}

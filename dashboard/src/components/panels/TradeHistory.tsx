@@ -70,7 +70,9 @@ export default function TradeHistory() {
   const handleExport = useCallback(async () => {
     setExporting(true);
     try {
-      const { trades: allTrades } = await getTrades(10000, 0, "desc");
+      // First fetch to get total count, then fetch all
+      const { total: totalCount } = await getTrades(1, 0, "desc");
+      const { trades: allTrades } = await getTrades(totalCount || 100000, 0, "desc");
       const rows = allTrades.map((t) =>
         CSV_HEADERS.map((h) => escapeCsv(t[h])).join(",")
       );

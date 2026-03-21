@@ -607,7 +607,11 @@ async def get_trades_v2(limit: int = 50, offset: int = 0):
 
     # Fallback: Redis trade history
     try:
-        response = await http_client.get(f"{SERVICES['position']}/trades", timeout=5.0)
+        response = await http_client.get(
+            f"{SERVICES['position']}/trades",
+            params={"limit": limit, "offset": offset},
+            timeout=5.0,
+        )
         if response.status_code == 200:
             return response.json()
     except Exception:
