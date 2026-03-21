@@ -1,7 +1,14 @@
 "use client";
 
-import { useState } from "react";
-import { ArrowUpDown } from "lucide-react";
+import { useState, useCallback } from "react";
+import {
+  ArrowUpDown,
+  ChevronLeft,
+  ChevronRight,
+  ChevronsLeft,
+  ChevronsRight,
+  Download,
+} from "lucide-react";
 import {
   formatCurrency,
   formatPrice,
@@ -10,20 +17,77 @@ import {
   getPnlColor,
   cn,
 } from "@/lib/utils";
-import type { Trade } from "@/types";
+import { useTrades } from "@/hooks/usePortfolio";
+import { getTrades } from "@/lib/api";
 
-interface TradeHistoryProps {
-  trades: Trade[] | undefined;
-  isLoading: boolean;
-  limit?: number;
+const PAGE_SIZE_OPTIONS = [10, 20, 50] as const;
+
+const CSV_HEADERS = [
+  "closed_at",
+  "created_at",
+  "symbol",
+  "side",
+  "entry_price",
+  "exit_price",
+  "amount",
+  "realized_pnl",
+  "pnl_pct",
+  "hold_time_seconds",
+  "exit_reason",
+  "strategy",
+] as const;
+
+function escapeCsv(value: string | number): string {
+  const str = String(value);
+  if (str.includes(",") || str.includes('"') || str.includes("\n")) {
+    return `"${str.replace(/"/g, '""')}"`;
+  }
+  return str;
 }
 
-export default function TradeHistory({
-  trades,
-  isLoading,
-  limit = 10,
-}: TradeHistoryProps) {
+export default function TradeHistory() {
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState<number>(20);
   const [sortAsc, setSortAsc] = useState(false);
+  const [exporting, setExporting] = useState(false);
+
+  const sort = sortAsc ? "asc" : "desc";
+  const { data, isLoading, isFetching } = useTrades(page, pageSize, sort);
+
+  const trades = data?.trades ?? [];
+  const total = data?.total ?? 0;
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+
+  const handlePageSize = (size: number) => {
+    setPageSize(size);
+    setPage(1);
+  };
+
+  const handleSort = () => {
+    setSortAsc(!sortAsc);
+    setPage(1);
+  };
+
+  const handleExport = useCallback(async () => {
+    setExporting(true);
+    try {
+      const { trades: allTrades } = await getTrades(10000, 0, "desc");
+      const rows = allTrades.map((t) =>
+        CSV_HEADERS.map((h) => escapeCsv(t[h])).join(",")
+      );
+      const csv = [CSV_HEADERS.join(","), ...rows].join("\n");
+
+      const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `goblin_trades_${new Date().toISOString().slice(0, 10)}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } finally {
+      setExporting(false);
+    }
+  }, []);
 
   if (isLoading) {
     return (
@@ -35,26 +99,40 @@ export default function TradeHistory({
     );
   }
 
-  const sorted = [...(trades || [])].sort((a, b) => {
-    const diff =
-      new Date(a.closed_at).getTime() - new Date(b.closed_at).getTime();
-    return sortAsc ? diff : -diff;
-  });
-
-  const display = sorted.slice(0, limit);
-
   return (
     <div className="card overflow-hidden p-0">
+      {/* Header */}
       <div className="flex items-center justify-between border-b border-gray-800 px-5 py-3">
-        <h3 className="font-semibold text-white">Recent Trades</h3>
+        <div className="flex items-center gap-3">
+          <h3 className="font-semibold text-white">Recent Trades</h3>
+          {total > 0 && (
+            <span className="text-xs text-gray-500">
+              {total} total
+            </span>
+          )}
+          {isFetching && !isLoading && (
+            <span className="h-2 w-2 rounded-full bg-green-500 animate-pulse" />
+          )}
+          <button
+            onClick={handleSort}
+            className="flex items-center gap-1 text-xs text-gray-400 hover:text-white transition-colors"
+          >
+            <ArrowUpDown size={14} />
+            {sortAsc ? "Oldest" : "Newest"}
+          </button>
+        </div>
         <button
-          onClick={() => setSortAsc(!sortAsc)}
-          className="flex items-center gap-1 text-xs text-gray-400 hover:text-white transition-colors"
+          onClick={handleExport}
+          disabled={exporting || total === 0}
+          className="flex items-center gap-1.5 rounded-md border border-gray-700 bg-gray-800 px-3 py-1.5 text-xs text-gray-300 hover:border-green-500/50 hover:text-white disabled:opacity-40 disabled:hover:border-gray-700 disabled:hover:text-gray-300 transition-colors"
+          title="Download all trades as CSV"
         >
-          <ArrowUpDown size={14} />
-          {sortAsc ? "Oldest" : "Newest"}
+          <Download size={14} className={exporting ? "animate-bounce" : ""} />
+          {exporting ? "Exporting..." : "Export CSV"}
         </button>
       </div>
+
+      {/* Table */}
       <div className="overflow-x-auto">
         <table className="w-full text-sm">
           <thead>
@@ -71,7 +149,7 @@ export default function TradeHistory({
             </tr>
           </thead>
           <tbody>
-            {display.length === 0 ? (
+            {trades.length === 0 ? (
               <tr>
                 <td
                   colSpan={9}
@@ -81,9 +159,9 @@ export default function TradeHistory({
                 </td>
               </tr>
             ) : (
-              display.map((trade, i) => (
+              trades.map((trade, i) => (
                 <tr
-                  key={i}
+                  key={`${trade.symbol}-${trade.closed_at}-${i}`}
                   className="border-b border-gray-800/50 hover:bg-gray-800/30 transition-colors"
                 >
                   <td className="whitespace-nowrap px-5 py-2.5 text-xs text-gray-400">
@@ -136,6 +214,71 @@ export default function TradeHistory({
           </tbody>
         </table>
       </div>
+
+      {/* Pagination footer */}
+      {total > 0 && (
+        <div className="flex items-center justify-between border-t border-gray-800 px-5 py-2.5">
+          {/* Page size selector */}
+          <div className="flex items-center gap-2 text-xs text-gray-400">
+            <span>Rows</span>
+            <select
+              value={pageSize}
+              onChange={(e) => handlePageSize(Number(e.target.value))}
+              className="rounded border border-gray-700 bg-gray-800 px-2 py-1 text-xs text-gray-300 outline-none focus:border-green-500"
+            >
+              {PAGE_SIZE_OPTIONS.map((size) => (
+                <option key={size} value={size}>
+                  {size}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          {/* Page info + navigation */}
+          <div className="flex items-center gap-1">
+            <span className="mr-3 text-xs text-gray-400">
+              {(page - 1) * pageSize + 1}–
+              {Math.min(page * pageSize, total)} of {total}
+            </span>
+
+            <button
+              onClick={() => setPage(1)}
+              disabled={page <= 1}
+              className="rounded p-1 text-gray-400 hover:bg-gray-700 hover:text-white disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:text-gray-400 transition-colors"
+              title="First page"
+            >
+              <ChevronsLeft size={16} />
+            </button>
+            <button
+              onClick={() => setPage((p) => Math.max(1, p - 1))}
+              disabled={page <= 1}
+              className="rounded p-1 text-gray-400 hover:bg-gray-700 hover:text-white disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:text-gray-400 transition-colors"
+              title="Previous page"
+            >
+              <ChevronLeft size={16} />
+            </button>
+            <span className="mx-2 text-xs text-gray-300">
+              {page} / {totalPages}
+            </span>
+            <button
+              onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+              disabled={page >= totalPages}
+              className="rounded p-1 text-gray-400 hover:bg-gray-700 hover:text-white disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:text-gray-400 transition-colors"
+              title="Next page"
+            >
+              <ChevronRight size={16} />
+            </button>
+            <button
+              onClick={() => setPage(totalPages)}
+              disabled={page >= totalPages}
+              className="rounded p-1 text-gray-400 hover:bg-gray-700 hover:text-white disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:text-gray-400 transition-colors"
+              title="Last page"
+            >
+              <ChevronsRight size={16} />
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

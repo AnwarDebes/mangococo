@@ -252,11 +252,17 @@ export async function getPositions(): Promise<Position[]> {
   }
 }
 
-export async function getTrades(): Promise<Trade[]> {
+export async function getTrades(
+  limit = 20,
+  offset = 0,
+  sort: "desc" | "asc" = "desc"
+): Promise<{ trades: Trade[]; total: number }> {
   try {
     let data: unknown;
     try {
-      data = await requestJson("/api/v2/trades");
+      data = await requestJson(
+        `/api/v2/trades?limit=${limit}&offset=${offset}`
+      );
     } catch {
       data = await requestJson("/api/trades");
     }
@@ -268,12 +274,21 @@ export async function getTrades(): Promise<Trade[]> {
       ? root.trades
       : [];
 
-    return items
+    const total =
+      typeof root.total === "number" ? root.total : items.length;
+
+    const trades = items
       .map((item) => mapTrade(item))
-      .sort((a, b) => new Date(b.closed_at).getTime() - new Date(a.closed_at).getTime());
+      .sort((a, b) => {
+        const diff =
+          new Date(a.closed_at).getTime() - new Date(b.closed_at).getTime();
+        return sort === "asc" ? diff : -diff;
+      });
+
+    return { trades, total };
   } catch (err) {
     console.error("[api] getTrades failed:", err);
-    return [];
+    return { trades: [], total: 0 };
   }
 }
 

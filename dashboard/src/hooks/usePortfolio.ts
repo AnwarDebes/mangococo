@@ -1,6 +1,6 @@
 "use client";
 
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, keepPreviousData } from "@tanstack/react-query";
 import { getPortfolio, getPositions, getTrades } from "@/lib/api";
 
 export function usePortfolio() {
@@ -19,10 +19,16 @@ export function usePositions() {
   });
 }
 
-export function useTrades() {
+export function useTrades(
+  page = 1,
+  pageSize = 20,
+  sort: "desc" | "asc" = "desc"
+) {
+  const offset = (page - 1) * pageSize;
   return useQuery({
-    queryKey: ["trades"],
-    queryFn: getTrades,
+    queryKey: ["trades", page, pageSize, sort],
+    queryFn: () => getTrades(pageSize, offset, sort),
     refetchInterval: 10000,
+    placeholderData: keepPreviousData,
   });
 }

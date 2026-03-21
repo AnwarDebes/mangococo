@@ -32,7 +32,8 @@ function StatCard({
 }
 
 export default function AnalyticsPage() {
-  const { data: trades, isLoading } = useTrades();
+  const { data: tradesData, isLoading } = useTrades(1, 50);
+  const trades = tradesData?.trades;
 
   // Compute metrics
   const winTrades = trades?.filter((t) => t.realized_pnl > 0) || [];
@@ -210,7 +211,7 @@ export default function AnalyticsPage() {
       />
 
       {/* Full Trade History */}
-      <TradeHistory trades={trades} isLoading={isLoading} limit={50} />
+      <TradeHistory />
     </div>
   );
 }

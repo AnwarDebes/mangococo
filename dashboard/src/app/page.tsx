@@ -61,7 +61,8 @@ function MetricCard({
 export default function DashboardPage() {
   const { data: rawPortfolio, isLoading: loadingPortfolio } = usePortfolio();
   const { data: positions, isLoading: loadingPositions } = usePositions();
-  const { data: trades, isLoading: loadingTrades } = useTrades();
+  const { data: tradesData, isLoading: loadingTrades } = useTrades(1, 50);
+  const trades = tradesData?.trades;
 
   // Reconcile portfolio values with actual positions data so all numbers
   // displayed on the dashboard are internally consistent.
@@ -191,7 +192,7 @@ export default function DashboardPage() {
       </div>
 
       {/* Recent Trades */}
-      <TradeHistory trades={trades} isLoading={loadingTrades} />
+      <TradeHistory />
 
       {/* System Health */}
       <div>

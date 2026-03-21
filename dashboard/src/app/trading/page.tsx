@@ -1,8 +1,6 @@
 "use client";
 
 import { useState } from "react";
-import { usePositions } from "@/hooks/usePortfolio";
-import PositionCard from "@/components/panels/PositionCard";
 import SignalFeed from "@/components/panels/SignalFeed";
 import PriceChart from "@/components/charts/PriceChart";
 import AITimeline from "@/components/panels/AITimeline";
@@ -10,7 +8,6 @@ import ManualTradePanel from "@/components/panels/ManualTradePanel";
 import MultiTimeframe from "@/components/trading/MultiTimeframe";
 
 export default function TradingPage() {
-  const { data: positions, isLoading } = usePositions();
   const [showManualTrade, setShowManualTrade] = useState(false);
   const [viewMode, setViewMode] = useState<"single" | "multi">("single");
 
@@ -67,28 +64,6 @@ export default function TradingPage() {
 
       {/* AI Decision Timeline */}
       <AITimeline />
-
-      {/* Current Positions */}
-      <div>
-        <h2 className="section-title mb-3">Active Positions</h2>
-        {isLoading ? (
-          <div className="grid gap-3 sm:gap-4 grid-cols-1 sm:grid-cols-2 lg:grid-cols-3">
-            {Array.from({ length: 3 }).map((_, i) => (
-              <div key={i} className="card skeleton-shimmer h-36" />
-            ))}
-          </div>
-        ) : !positions || positions.length === 0 ? (
-          <div className="card text-center text-sm text-gray-500 py-8">
-            No active positions
-          </div>
-        ) : (
-          <div className="grid gap-3 sm:gap-4 grid-cols-1 sm:grid-cols-2 lg:grid-cols-3">
-            {positions.map((pos, i) => (
-              <PositionCard key={`${pos.symbol}-${i}`} position={pos} />
-            ))}
-          </div>
-        )}
-      </div>
 
       {/* Manual Trade Side Panel */}
       {showManualTrade && (

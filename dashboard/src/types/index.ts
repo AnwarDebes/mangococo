@@ -27,6 +27,11 @@ export interface Trade {
   closed_at: string;
 }
 
+export interface PaginatedTrades {
+  trades: Trade[];
+  total: number;
+}
+
 export interface Signal {
   signal_id: string;
   symbol: string;

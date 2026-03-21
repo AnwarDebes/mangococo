@@ -25,14 +25,14 @@ import { useMemo } from "react";
 export function useShopData() {
   const portfolio = useQuery({ queryKey: ["portfolio"], queryFn: getPortfolio, refetchInterval: 10000 });
   const positions = useQuery({ queryKey: ["positions"], queryFn: getPositions, refetchInterval: 10000 });
-  const trades = useQuery({ queryKey: ["trades"], queryFn: getTrades, refetchInterval: 15000 });
+  const trades = useQuery({ queryKey: ["trades", "shop"], queryFn: () => getTrades(50), refetchInterval: 15000 });
   const signals = useQuery({ queryKey: ["signals"], queryFn: getSignals, refetchInterval: 5000 });
   const sentiment = useQuery({ queryKey: ["sentiment"], queryFn: getSentiment, refetchInterval: 15000 });
   const models = useQuery({ queryKey: ["models"], queryFn: getModelStatus, refetchInterval: 20000 });
   const health = useQuery({ queryKey: ["system-health"], queryFn: getSystemHealth, refetchInterval: 20000 });
   const tickers = useQuery({ queryKey: ["tickers"], queryFn: getAllTickers, refetchInterval: 10000 });
 
-  const tradesList = trades.data ?? [];
+  const tradesList = trades.data?.trades ?? [];
   const signalsList = signals.data ?? [];
   const sentimentList = sentiment.data ?? [];
   const modelsList = models.data ?? [];

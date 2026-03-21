@@ -26,7 +26,7 @@ export function useNerveCenterData() {
   const resources = useQuery({ queryKey: ["resources"], queryFn: getResourceMetrics, refetchInterval: 10000 });
   const fearGreed = useQuery({ queryKey: ["fear-greed"], queryFn: () => getFearGreed(7), refetchInterval: 60000 });
   const globalMarket = useQuery({ queryKey: ["global-market"], queryFn: getGlobalMarket, refetchInterval: 30000 });
-  const trades = useQuery({ queryKey: ["trades"], queryFn: getTrades, refetchInterval: 15000 });
+  const trades = useQuery({ queryKey: ["trades", "nerve"], queryFn: () => getTrades(50), refetchInterval: 15000 });
 
   return {
     portfolio: portfolio.data,
@@ -40,7 +40,7 @@ export function useNerveCenterData() {
     resources: resources.data ?? [],
     fearGreed: fearGreed.data,
     globalMarket: globalMarket.data,
-    trades: trades.data ?? [],
+    trades: trades.data?.trades ?? [],
     isLoading: portfolio.isLoading || positions.isLoading,
   };
 }
