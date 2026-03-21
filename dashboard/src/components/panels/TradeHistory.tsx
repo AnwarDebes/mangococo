@@ -13,7 +13,6 @@ import {
   formatCurrency,
   formatPrice,
   formatPercent,
-  getTimeSince,
   getPnlColor,
   cn,
 } from "@/lib/utils";
@@ -165,7 +164,15 @@ export default function TradeHistory() {
                   className="border-b border-gray-800/50 hover:bg-gray-800/30 transition-colors"
                 >
                   <td className="whitespace-nowrap px-5 py-2.5 text-xs text-gray-400">
-                    {getTimeSince(trade.closed_at)}
+                    {new Date(trade.closed_at).toLocaleString("en-GB", {
+                      day: "2-digit",
+                      month: "2-digit",
+                      year: "numeric",
+                      hour: "2-digit",
+                      minute: "2-digit",
+                      second: "2-digit",
+                      hour12: false,
+                    })}
                   </td>
                   <td className="px-3 py-2.5 font-medium text-white">
                     {trade.symbol}

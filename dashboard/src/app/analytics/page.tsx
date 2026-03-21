@@ -3,7 +3,6 @@
 import { useTrades } from "@/hooks/usePortfolio";
 import { formatPercent, cn, getPnlColor, computeMaxDrawdown } from "@/lib/utils";
 import EquityCurve from "@/components/charts/EquityCurve";
-import TradeHistory from "@/components/panels/TradeHistory";
 import StressTest from "@/components/panels/StressTest";
 import StrategyLeaderboard from "@/components/panels/StrategyLeaderboard";
 import PerformanceReport from "@/components/panels/PerformanceReport";
@@ -209,9 +208,6 @@ export default function AnalyticsPage() {
         maxDrawdown={maxDrawdown}
         profitFactor={profitFactor}
       />
-
-      {/* Full Trade History */}
-      <TradeHistory />
     </div>
   );
 }
