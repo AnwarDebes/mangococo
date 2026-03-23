@@ -16,7 +16,7 @@ import structlog
 
 logger = structlog.get_logger()
 
-DEFAULT_REGISTRY_DIR = os.getenv("MODEL_REGISTRY_DIR", "/app/shared/models")
+DEFAULT_REGISTRY_DIR = os.environ.get("MODEL_REGISTRY_DIR", os.environ.get("MODEL_DIR", "/home/coder/Goblin/shared/models"))
 MANIFEST_FILENAME = "registry.json"
 
 

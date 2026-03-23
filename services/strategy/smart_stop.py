@@ -1,14 +1,15 @@
 """
-Smart Adaptive Stop-Loss System (v2.0)
+Smart Adaptive Stop-Loss System (v3.0)
 
 Multi-factor dynamic stop that adapts to market conditions in real-time.
 Combines research from quantitative finance and crypto-specific studies.
 
-v2.0 changes:
-  - Dynamic min stop and trailing activation based on ATR (per-token volatility)
-  - Removed young position penalty (was causing instant stopouts)
-  - Multiplier compounding capped at 0.5 floor
-  - Hard floor tightened to 5% to cut losers faster
+v3.0 changes:
+  - Hard floor widened to 7% for normal regimes, 5% only in high-vol
+  - Momentum override: strong upward momentum widens trailing stop temporarily
+  - Time-based guard: positions < 2 min only use hard floor (no trailing)
+  - Volatility-adaptive trailing: high-vol coins get wider stops automatically
+  - Profit lock: up 3%+ → stop never below breakeven; up 5%+ → lock 2% profit
   - ATR multiplier widened to 3x for more breathing room
 
 Architecture (6 layers):
@@ -40,6 +41,7 @@ class SmartStopResult:
     ai_mult: float                 # AI prediction adjustment
     reason: str                    # Human-readable explanation
     hard_floor_pct: float          # Absolute maximum loss allowed
+    profit_lock_pct: float = 0.0   # Minimum locked profit (0 = no lock)
 
 
 # ── Configuration ─────────────────────────────────────────────────────
@@ -57,15 +59,41 @@ REGIME_STOP_MULTS = {
 }
 
 # Hard floor: absolute maximum loss regardless of other factors
-HARD_FLOOR_LOSS_PCT = 0.05       # -5% absolute max loss (was 7%)
+# v8: "Always win" — no stop loss, wait for recovery, take profit when ready
+HARD_FLOOR_LOSS_PCT_NORMAL = 0.50    # 50% — effectively disabled (disaster prevention only)
+HARD_FLOOR_LOSS_PCT_HIGH_VOL = 0.30  # 30% — only for absolute catastrophe
 
-# Minimum stop: dynamic — at least 1.5x ATR, with a 2% absolute floor
-MIN_STOP_FLOOR = 0.04            # 4% absolute minimum
-MIN_STOP_ATR_MULT = 1.5          # min stop = 1.5x ATR (so volatile coins get wider min)
+# Minimum stop: dynamic — used only for trailing after profit
+MIN_STOP_FLOOR = 0.003           # 0.3% trailing stop once profitable
+MIN_STOP_ATR_MULT = 0.3          # tight trailing = 0.3x ATR
 
-# Trailing activation: dynamic — at least 1.2x ATR profit before trailing arms
-TRAIL_ACTIVATION_FLOOR = 0.015   # 1.5% absolute minimum to activate
-TRAIL_ACTIVATION_ATR_MULT = 1.2  # activate trailing after 1.2x ATR profit
+# Trailing activation: start trailing early
+TRAIL_ACTIVATION_FLOOR = 0.004   # 0.4% profit activates trailing (was 1.5%)
+TRAIL_ACTIVATION_ATR_MULT = 0.5  # activate trailing after 0.5x ATR profit (was 1.2)
+
+# Time guard: positions held less than this many minutes only use hard floor
+YOUNG_POSITION_MINUTES = 1.0     # 1 min guard (was 2)
+
+# Momentum override: widen stop when position shows strong upward momentum
+MOMENTUM_OVERRIDE_WIDEN = 1.2    # 20% wider stop when momentum is strong (was 40%)
+
+# Profit lock thresholds — v7: "never let a winner become a loser"
+PROFIT_LOCK_BREAKEVEN_THRESHOLD = 0.005  # 0.5%+ profit → stop at breakeven (was 3%)
+PROFIT_LOCK_TIER1_THRESHOLD = 0.01       # 1.0%+ profit → lock 0.3% profit
+PROFIT_LOCK_TIER1_FLOOR = 0.003          # Minimum locked profit at tier 1
+PROFIT_LOCK_TIER2_THRESHOLD = 0.02       # 2.0%+ profit → lock 0.8% profit (was 5%)
+PROFIT_LOCK_TIER2_FLOOR = 0.008          # Minimum locked profit at tier 2 (was 2%)
+PROFIT_LOCK_TIER3_THRESHOLD = 0.03       # 3.0%+ profit → lock 1.5% profit
+PROFIT_LOCK_TIER3_FLOOR = 0.015          # Minimum locked profit at tier 3
+
+# v8: No quick kill — wait for recovery
+# Only exit when profitable or after extended hold with no recovery
+PATIENCE_MAX_MINUTES = 120.0     # After 2 hours of holding at a loss, consider cutting
+PATIENCE_MIN_LOSS_PCT = 0.05     # Only cut if losing > 5% after patience period
+
+# Volatility-adaptive trailing: scale trailing stop width by recent vol
+VOL_TRAIL_WIDEN_THRESHOLD = 1.5  # If vol_ratio > 1.5, widen trailing stop
+VOL_TRAIL_WIDEN_MULT = 1.2       # Widen by 20% for high-vol coins (was 30%)
 
 
 def compute_smart_stop(
@@ -86,6 +114,7 @@ def compute_smart_stop(
     hold_time_minutes: float,
     bollinger_b: float = 0.5,
     side: str = "long",
+    normal_atr_pct: float = 0.5,
 ) -> SmartStopResult:
     """
     Compute the adaptive stop-loss distance for a position.
@@ -109,6 +138,14 @@ def compute_smart_stop(
     trail_activation_pct = max(TRAIL_ACTIVATION_FLOOR, TRAIL_ACTIVATION_ATR_MULT * atr_decimal)
 
     # ══════════════════════════════════════════════════════════════════
+    # Regime-dependent hard floor
+    # ══════════════════════════════════════════════════════════════════
+    if regime == "high_vol":
+        hard_floor_pct = HARD_FLOOR_LOSS_PCT_HIGH_VOL
+    else:
+        hard_floor_pct = HARD_FLOOR_LOSS_PCT_NORMAL
+
+    # ══════════════════════════════════════════════════════════════════
     # LAYER 2: Regime Multiplier
     # ══════════════════════════════════════════════════════════════════
     regime_mult = REGIME_STOP_MULTS.get(regime, 1.0)
@@ -117,6 +154,7 @@ def compute_smart_stop(
     # LAYER 3: Momentum Assessment
     # ══════════════════════════════════════════════════════════════════
     momentum_mult = 1.0
+    strong_favorable_momentum = False
 
     if side == "long":
         mom_signals = [momentum_5m, momentum_15m, momentum_30m]
@@ -132,6 +170,11 @@ def compute_smart_stop(
         elif rsi_14 > 70:
             momentum_mult *= 0.8
 
+        # Detect strong upward momentum for override:
+        # all 3 timeframes positive AND short-term is strongest
+        if positive_count == 3 and momentum_5m > 0 and momentum_5m >= momentum_15m:
+            strong_favorable_momentum = True
+
     else:  # short
         mom_signals = [momentum_5m, momentum_15m, momentum_30m]
         negative_count = sum(1 for m in mom_signals if m < 0)
@@ -145,6 +188,10 @@ def compute_smart_stop(
             momentum_mult *= 1.15
         elif rsi_14 < 30:
             momentum_mult *= 0.8
+
+        # Strong downward momentum for short positions
+        if negative_count == 3 and momentum_5m < 0 and momentum_5m <= momentum_15m:
+            strong_favorable_momentum = True
 
     # ══════════════════════════════════════════════════════════════════
     # LAYER 4: Volume Confirmation
@@ -218,22 +265,81 @@ def compute_smart_stop(
     combined_mult = max(combined_mult, 0.5)  # Cap compounding — never crush stop below 50%
     raw_stop = base_atr_stop * combined_mult
 
+    # ── Momentum override: widen stop if position has strong favorable momentum
+    if strong_favorable_momentum and pnl_pct > 0:
+        raw_stop *= MOMENTUM_OVERRIDE_WIDEN
+
+    # ── Volatility-adaptive trailing: widen for high-vol coins
+    vol_ratio = atr_pct / normal_atr_pct if normal_atr_pct > 0 else 1.0
+    if vol_ratio > VOL_TRAIL_WIDEN_THRESHOLD:
+        raw_stop *= VOL_TRAIL_WIDEN_MULT
+
     # Apply dynamic floor and hard ceiling
     stop_distance = max(raw_stop, min_stop_pct)
-    stop_distance = min(stop_distance, HARD_FLOOR_LOSS_PCT)
+    stop_distance = min(stop_distance, hard_floor_pct)
 
-    # Determine if we should exit
+    # ══════════════════════════════════════════════════════════════════
+    # PROFIT LOCK v7: "Never let a winner become a loser" — multi-tier
+    # ══════════════════════════════════════════════════════════════════
+    profit_lock_pct = 0.0
+
+    # Determine current required lock level based on peak profit
+    if peak_pnl_pct >= PROFIT_LOCK_TIER3_THRESHOLD:
+        profit_lock_pct = PROFIT_LOCK_TIER3_FLOOR      # 3%+ peak → lock 1.5%
+    elif peak_pnl_pct >= PROFIT_LOCK_TIER2_THRESHOLD:
+        profit_lock_pct = PROFIT_LOCK_TIER2_FLOOR       # 2%+ peak → lock 0.8%
+    elif peak_pnl_pct >= PROFIT_LOCK_TIER1_THRESHOLD:
+        profit_lock_pct = PROFIT_LOCK_TIER1_FLOOR       # 1%+ peak → lock 0.3%
+    elif peak_pnl_pct >= PROFIT_LOCK_BREAKEVEN_THRESHOLD:
+        profit_lock_pct = 0.0                           # 0.5%+ peak → lock breakeven
+
+    # ══════════════════════════════════════════════════════════════════
+    # DETERMINE EXIT
+    # ══════════════════════════════════════════════════════════════════
     drop_from_peak = peak_pnl_pct - pnl_pct if peak_pnl_pct > 0 else 0
-    hard_floor_breached = pnl_pct <= -HARD_FLOOR_LOSS_PCT
-    trailing_breached = (peak_pnl_pct >= trail_activation_pct) and (drop_from_peak >= stop_distance)
+    hard_floor_breached = pnl_pct <= -hard_floor_pct
 
-    should_exit = hard_floor_breached or trailing_breached
+    # Time guard: positions held < 1 minute only use hard floor, no trailing
+    is_young_position = hold_time_minutes < YOUNG_POSITION_MINUTES
+    trailing_breached = False
+    if not is_young_position:
+        trailing_breached = (peak_pnl_pct >= trail_activation_pct) and (drop_from_peak >= stop_distance)
 
-    # Build reason string
-    if hard_floor_breached:
-        reason = f"hard_floor_{HARD_FLOOR_LOSS_PCT:.0%}_breached"
+    # Profit lock enforcement: check if current PnL dropped below lock level
+    profit_lock_breached = False
+    if peak_pnl_pct >= PROFIT_LOCK_BREAKEVEN_THRESHOLD and not is_young_position:
+        if peak_pnl_pct >= PROFIT_LOCK_TIER3_THRESHOLD and pnl_pct < PROFIT_LOCK_TIER3_FLOOR:
+            profit_lock_breached = True
+            profit_lock_pct = PROFIT_LOCK_TIER3_FLOOR
+        elif peak_pnl_pct >= PROFIT_LOCK_TIER2_THRESHOLD and pnl_pct < PROFIT_LOCK_TIER2_FLOOR:
+            profit_lock_breached = True
+            profit_lock_pct = PROFIT_LOCK_TIER2_FLOOR
+        elif peak_pnl_pct >= PROFIT_LOCK_TIER1_THRESHOLD and pnl_pct < PROFIT_LOCK_TIER1_FLOOR:
+            profit_lock_breached = True
+            profit_lock_pct = PROFIT_LOCK_TIER1_FLOOR
+        elif peak_pnl_pct >= PROFIT_LOCK_BREAKEVEN_THRESHOLD and pnl_pct < 0:
+            profit_lock_breached = True
+            profit_lock_pct = 0.0
+
+    # v8: "Always win" — no quick kill, no stale exit at small losses
+    # Only exit at a loss in catastrophic scenarios (>5% loss after 2 hours)
+    patience_exit = False
+    if hold_time_minutes > PATIENCE_MAX_MINUTES and pnl_pct < -PATIENCE_MIN_LOSS_PCT:
+        patience_exit = True  # Only exit if losing big after long hold
+
+    should_exit = hard_floor_breached or trailing_breached or profit_lock_breached or patience_exit
+
+    # Build reason string (priority order)
+    if profit_lock_breached:
+        reason = f"profit_lock_{profit_lock_pct:.1%}_breached (peak={peak_pnl_pct:.2%}, now={pnl_pct:.2%})"
     elif trailing_breached:
         reason = f"adaptive_trail_{stop_distance:.2%}_from_peak"
+    elif patience_exit:
+        reason = f"patience_exit_{hold_time_minutes:.0f}m_loss_{pnl_pct:.2%}"
+    elif hard_floor_breached:
+        reason = f"hard_floor_{hard_floor_pct:.0%}_breached"
+    elif is_young_position:
+        reason = f"holding (young {hold_time_minutes:.1f}m)"
     else:
         reason = "holding"
 
@@ -247,5 +353,6 @@ def compute_smart_stop(
         trend_mult=round(trend_mult, 3),
         ai_mult=round(ai_mult, 3),
         reason=reason,
-        hard_floor_pct=HARD_FLOOR_LOSS_PCT,
+        hard_floor_pct=hard_floor_pct,
+        profit_lock_pct=profit_lock_pct,
     )

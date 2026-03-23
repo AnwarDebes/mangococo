@@ -8,8 +8,9 @@ On startup the service loads trained models from the shared/models/
 directory.  If models are not yet available it falls back to a legacy
 rule-based TA strategy (degraded mode).
 
-A background task runs every 5 seconds, performing batch inference for
+A background task runs every 2 seconds, performing batch inference for
 all active symbols and publishing predictions to Redis pubsub.
+If a previous cycle is still running, the next tick is skipped.
 """
 
 import asyncio
@@ -17,6 +18,7 @@ import json
 import os
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
@@ -44,9 +46,9 @@ from models.model_registry import ModelRegistry
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "")
-MODEL_DIR = os.getenv("MODEL_DIR", "/app/shared/models")
+MODEL_DIR = Path(os.environ.get("MODEL_DIR", "/home/coder/Goblin/shared/models"))
 FEATURE_STORE_URL = os.getenv("FEATURE_STORE_URL", "http://localhost:8007")
-INFERENCE_INTERVAL = float(os.getenv("INFERENCE_INTERVAL", 5.0))
+INFERENCE_INTERVAL = float(os.getenv("INFERENCE_INTERVAL", 2.0))
 TRADING_PAIRS_FILE = os.getenv("TRADING_PAIRS_FILE", "")
 TRADING_PAIRS = os.getenv("TRADING_PAIRS", "BTC/USDT,ETH/USDT,SOL/USDT").split(",")
 MAX_ACTIVE_PAIRS = int(os.getenv("MAX_ACTIVE_PAIRS", 50))
@@ -98,7 +100,7 @@ class ModelStatusResponse(BaseModel):
     tcn_accuracy: Optional[float] = None
     xgb_accuracy: Optional[float] = None
     last_train_time: Optional[str] = None
-    registry_dir: str = MODEL_DIR
+    registry_dir: str = str(MODEL_DIR)
 
 
 class HealthResponse(BaseModel):
@@ -532,22 +534,61 @@ async def prediction_loop():
       Phase 2 (GPU, single call): Batched TCN + XGBoost inference.
       Phase 3 (CPU):              Ensemble combination per symbol.
       Phase 4 (Redis):            Publish all predictions.
+
+    If a previous cycle is still running when the next tick fires, the new
+    cycle is skipped (no queueing) to avoid GPU contention and memory buildup.
     """
     from models.ensemble import _direction_sign
+
+    _inference_running = False
 
     while True:
         await asyncio.sleep(INFERENCE_INTERVAL)
 
+        if _inference_running:
+            logger.debug("Skipping inference cycle — previous cycle still running")
+            continue
+
+        _inference_running = True
         try:
             cycle_start = time.monotonic()
             symbols = [s.strip() for s in TRADING_PAIRS]
 
-            # Filter to symbols with enough data, rank by data availability
+            # Filter to symbols with enough data AND sufficient volume/liquidity
+            MIN_TICK_COUNT = 20
+            MIN_LAST_PRICE = 0.00001      # reject dust tokens (allow cheaper tokens)
+
             candidates = []
+            skipped_ticks = 0
+            skipped_price = 0
+
             for sym in symbols:
                 ticks = price_history.get(sym)
-                if ticks and len(ticks) >= 20:
-                    candidates.append((sym, len(ticks)))
+                if not ticks or len(ticks) < MIN_TICK_COUNT:
+                    skipped_ticks += 1
+                    continue
+
+                # Price safety net — use latest tick data
+                # Note: volume filtering is handled upstream by MEXC adapter at symbol discovery.
+                # Tick data from websocket only has per-tick volume, not 24h quote volume,
+                # so we only check price here.
+                latest = ticks[-1]
+                last_price = float(latest.get("close", latest.get("price", 0)) or 0)
+
+                if last_price < MIN_LAST_PRICE:
+                    skipped_price += 1
+                    continue
+
+                candidates.append((sym, len(ticks)))
+
+            if skipped_price or skipped_ticks:
+                logger.info(
+                    "Prediction eligibility filtering",
+                    total_symbols=len(symbols),
+                    skipped_low_ticks=skipped_ticks,
+                    skipped_low_price=skipped_price,
+                    passed=len(candidates),
+                )
 
             # Sort by tick count descending — prioritize pairs with most data
             candidates.sort(key=lambda x: x[1], reverse=True)
@@ -774,6 +815,8 @@ async def prediction_loop():
 
         except Exception as loop_exc:
             logger.error("Prediction loop iteration failed", error=str(loop_exc), error_type=type(loop_exc).__name__)
+        finally:
+            _inference_running = False
 
 
 # ---------------------------------------------------------------------------
@@ -959,7 +1002,7 @@ async def model_status():
         tcn_accuracy=tcn_acc,
         xgb_accuracy=xgb_acc,
         last_train_time=last_train,
-        registry_dir=MODEL_DIR,
+        registry_dir=str(MODEL_DIR),
     )
 
 

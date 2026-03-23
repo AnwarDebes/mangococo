@@ -76,6 +76,10 @@ class Position(BaseModel):
     peak_price: float = 0       # Highest price since entry (for longs), lowest for shorts
     peak_pnl_pct: float = 0     # Highest profit % reached
     trailing_active: bool = False  # Whether trailing stop is engaged
+    # v6: Momentum take-profit tracking
+    price_history: list = []     # Last N prices for momentum calculation
+    momentum_peak: float = 0    # Peak momentum value during the move
+    lowest_pnl_pct: float = 0   # v9: Track deepest loss for recovery bounce detection
 
 
 class ExitPressureTracker:
@@ -190,10 +194,28 @@ exit_tracker = ExitPressureTracker()
 async def handle_filled_order(order: dict):
     global positions
     symbol = order["symbol"]
-    side = "long" if order["side"] == "buy" else "short"
+    order_side = order["side"]  # "buy", "sell", "short_entry", or "short_exit"
     filled_amount = order.get("filled", 0)
     order_price = order.get("price", 0)
-    
+
+    # Determine position side from order type
+    if order_side == "short_entry":
+        position_side = "short"
+        is_opening = True
+        is_closing = False
+    elif order_side == "short_exit":
+        position_side = "short"
+        is_opening = False
+        is_closing = True
+    elif order_side == "buy":
+        position_side = "long"
+        is_opening = True
+        is_closing = False
+    else:  # "sell"
+        position_side = "long"
+        is_opening = False
+        is_closing = True
+
     if filled_amount == 0:
         logger.warning("Order has no filled amount, skipping", symbol=symbol, order_id=order.get("order_id"))
         return
@@ -201,31 +223,44 @@ async def handle_filled_order(order: dict):
     # Check if we have an existing open or closing position
     if symbol in positions and positions[symbol].status in ("open", "closing"):
         pos = positions[symbol]
-        # If closing position (sell when long, buy when short)
-        if (pos.side == "long" and order["side"] == "sell") or (pos.side == "short" and order["side"] == "buy"):
+
+        # Determine if this order closes the existing position
+        closing_existing = (
+            (pos.side == "long" and order_side == "sell") or
+            (pos.side == "short" and order_side in ("buy", "short_exit"))
+        )
+
+        if closing_existing:
             # Calculate realized P&L
             if pos.side == "long":
                 realized = (order_price - pos.entry_price) * filled_amount
             else:
+                # Short PnL: profit when price goes down
                 realized = (pos.entry_price - order_price) * filled_amount
-            
+
             pos.realized_pnl += realized
             pos.amount -= filled_amount
-            
+
             # If position is fully closed
             if pos.amount <= 0.0001:  # Account for floating point precision
                 pos.status = "closed"
                 pos.amount = 0
 
                 # Record trade in history
+                pnl_pct = ((order_price - pos.entry_price) / pos.entry_price) if pos.side == "long" else ((pos.entry_price - order_price) / pos.entry_price)
+                entry_cost_usd = pos.entry_price * filled_amount
+                exit_cost_usd = order_price * filled_amount
                 trade_record = {
                     "symbol": symbol,
                     "side": pos.side,
                     "entry_price": pos.entry_price,
                     "exit_price": order_price,
                     "amount": filled_amount,
+                    "entry_cost_usd": round(entry_cost_usd, 4),
+                    "exit_cost_usd": round(exit_cost_usd, 4),
                     "realized_pnl": realized,
                     "total_pnl": pos.realized_pnl,
+                    "pnl_pct": pnl_pct,
                     "entry_time": pos.opened_at,
                     "exit_time": datetime.utcnow().isoformat(),
                     "hold_time_minutes": (datetime.utcnow() - datetime.fromisoformat(pos.opened_at)).total_seconds() / 60,
@@ -234,8 +269,8 @@ async def handle_filled_order(order: dict):
                 await redis_client.lpush("trade_history", json.dumps(trade_record))
                 await redis_client.ltrim("trade_history", 0, 99_999)  # Keep last 100k trades
 
-                await redis_client.publish("position_closed", json.dumps({"symbol": symbol, "pnl": realized, "total_pnl": pos.realized_pnl}))
-                logger.info("Position closed", symbol=symbol, pnl=realized, total_pnl=pos.realized_pnl)
+                await redis_client.publish("position_closed", json.dumps({"symbol": symbol, "side": pos.side, "pnl": realized, "total_pnl": pos.realized_pnl}))
+                logger.info("Position closed", symbol=symbol, side=pos.side, pnl=realized, total_pnl=pos.realized_pnl)
             else:
                 logger.info("Position partially closed", symbol=symbol, remaining=pos.amount, pnl=realized)
         else:
@@ -250,6 +285,7 @@ async def handle_filled_order(order: dict):
             logger.info("Position increased", symbol=symbol, new_amount=pos.amount, avg_entry=pos.entry_price)
     else:
         # Opening new position — AI controls all exits, no hardcoded thresholds
+        side = "short" if order_side == "short_entry" else "long"
         positions[symbol] = Position(
             symbol=symbol, side=side, entry_price=order_price,
             current_price=order_price, amount=filled_amount, opened_at=datetime.utcnow().isoformat(),
@@ -338,7 +374,7 @@ async def close_position(symbol: str, reason: str):
             return
 
     pos = positions[symbol]
-    close_side = "sell" if pos.side == "long" else "buy"
+    close_side = "sell" if pos.side == "long" else "short_exit"
 
     # ATOMIC IDEMPOTENT UPDATE: Use Redis transaction to ensure only one close operation
     close_id = f"close_{symbol}_{int(datetime.utcnow().timestamp() * 1000)}"
@@ -468,6 +504,98 @@ async def update_prices():
                     pressure_state = exit_tracker.get_state(symbol)
                     ai_pressure = pressure_state["pressure"]
                     ai_threshold = pressure_state["threshold"]
+
+                    # ── MOMENTUM TAKE-PROFIT (v6) ──
+                    # Track price history for momentum calculation (every 0.5s tick)
+                    pos.price_history.append(pos.current_price)
+                    if len(pos.price_history) > 60:  # Keep last 30 seconds (60 * 0.5s)
+                        pos.price_history = pos.price_history[-60:]
+
+                    if len(pos.price_history) >= 6:
+                        # Calculate short-term momentum: rate of price change over last 3s vs previous 3s
+                        recent_prices = pos.price_history[-6:]  # Last 3 seconds
+                        prev_prices = pos.price_history[-12:-6] if len(pos.price_history) >= 12 else pos.price_history[:6]
+
+                        recent_momentum = (recent_prices[-1] - recent_prices[0]) / max(recent_prices[0], 1e-10)
+                        prev_momentum = (prev_prices[-1] - prev_prices[0]) / max(prev_prices[0], 1e-10)
+
+                        # For shorts, invert momentum (falling = positive momentum)
+                        if pos.side == "short":
+                            recent_momentum = -recent_momentum
+                            prev_momentum = -prev_momentum
+
+                        # Track peak momentum
+                        if recent_momentum > pos.momentum_peak:
+                            pos.momentum_peak = recent_momentum
+
+                        # ── v11: CRASH PROTECTION ──
+                        # If a coin drops >3% from entry, it's likely a rug/dump — exit immediately
+                        if pnl_pct < -0.03 and hold_time_minutes < 30:
+                            logger.info("CRASH PROTECTION EXIT — fast drop >3%",
+                                        symbol=symbol, pnl_pct=f"{pnl_pct:.2%}",
+                                        hold_min=f"{hold_time_minutes:.0f}")
+                            smart_stop_triggered.append((symbol, f"crash_protection_{pnl_pct:.1%}"))
+                            await redis_client.hset("positions", symbol, pos.model_dump_json())
+                            continue
+
+                        # ── v12: HARD STOP-LOSS (replaces recovery bounce) ──
+                        # Track deepest loss
+                        if pnl_pct < pos.lowest_pnl_pct:
+                            pos.lowest_pnl_pct = pnl_pct
+
+                        # Exit immediately at -1% — recovery bounce was losing $13+ across 12 trades
+                        if pnl_pct < -0.01:
+                            logger.info("HARD STOP-LOSS EXIT — position down >1%",
+                                        symbol=symbol,
+                                        pnl_pct=f"{pnl_pct:.2%}",
+                                        hold_min=f"{hold_time_minutes:.0f}",
+                                        profit_usd=f"{pos.unrealized_pnl:.2f}")
+                            smart_stop_triggered.append((symbol, f"hard_stop_{pnl_pct:.1%}"))
+                            await redis_client.hset("positions", symbol, pos.model_dump_json())
+                            continue
+
+                        # ── v12: STALE POSITION EXIT ──
+                        # If held >45 min and PnL near zero, exit to free capital
+                        if hold_time_minutes > 45 and -0.005 < pnl_pct < 0.002:
+                            logger.info("STALE POSITION EXIT — near-zero PnL after 45m",
+                                        symbol=symbol, pnl_pct=f"{pnl_pct:.2%}",
+                                        hold_min=f"{hold_time_minutes:.0f}",
+                                        profit_usd=f"{pos.unrealized_pnl:.2f}")
+                            smart_stop_triggered.append((symbol, f"stale_exit_{hold_time_minutes:.0f}m_pnl_{pnl_pct:.2%}"))
+                            await redis_client.hset("positions", symbol, pos.model_dump_json())
+                            continue
+
+                        # ── MOMENTUM TAKE-PROFIT (profitable positions) ──
+                        if pnl_pct >= 0.002:  # At least 0.2% profit (v10: lowered from 0.3% to capture more exits in chop)
+                            # v8: Momentum deceleration — only exit if momentum truly died
+                            momentum_decelerating = (
+                                pos.momentum_peak > 0.001 and   # Had strong momentum (0.1%+ in 3s)
+                                recent_momentum <= 0 and        # Momentum is now NEGATIVE
+                                pnl_pct >= 0.002                # At least 0.2% profit
+                            )
+
+                            # Profit giveback: only if gave back substantial profit
+                            profit_giveback = pos.peak_pnl_pct - pnl_pct
+                            fast_giveback = (
+                                pos.peak_pnl_pct >= 0.01 and    # Had 1%+ peak profit
+                                profit_giveback >= pos.peak_pnl_pct * 0.40  # Gave back 40%
+                                and recent_momentum <= 0
+                            )
+
+                            if momentum_decelerating or fast_giveback:
+                                reason = "momentum_decel" if momentum_decelerating else "profit_giveback"
+                                logger.info("MOMENTUM TAKE-PROFIT triggered",
+                                            symbol=symbol,
+                                            reason=reason,
+                                            pnl_pct=f"{pnl_pct:.2%}",
+                                            peak_pnl=f"{pos.peak_pnl_pct:.2%}",
+                                            giveback=f"{profit_giveback:.2%}",
+                                            recent_mom=f"{recent_momentum:.4%}",
+                                            peak_mom=f"{pos.momentum_peak:.4%}",
+                                            profit_usd=f"{pos.unrealized_pnl:.2f}")
+                                smart_stop_triggered.append((symbol, f"momentum_tp_{reason}"))
+                                await redis_client.hset("positions", symbol, pos.model_dump_json())
+                                continue
 
                     # ── SMART ADAPTIVE STOP (6-layer) ──
                     if SMART_STOP_ENABLED:
@@ -687,6 +815,16 @@ async def listen_for_prediction_exits():
                             threshold=f"{p_threshold:.3f}",
                             regime=regime_name, vol_urgency=f"{p_vol_urgency:.3f}",
                             should_exit=should_exit)
+
+            # v12: AI exits blocked only for moderate losses (-0.2% to -1%)
+            # Tiny losses (<0.2%): let AI exit — not worth holding
+            # Moderate losses: patience mode, wait for recovery
+            # Deep losses (>1%): hard stop-loss handles these
+            if should_exit and -0.01 < pnl_pct < -0.002:
+                logger.info("AI exit BLOCKED — patience mode for moderate loss",
+                            symbol=symbol, pnl_pct=f"{pnl_pct:.4%}", pressure=f"{pressure:.3f}")
+                exit_tracker.reset(symbol)
+                should_exit = False
 
             if should_exit:
                 # Determine specific exit reason for analytics

@@ -7,6 +7,7 @@ Decides whether to TAKE or SKIP a trade based on contextual quality:
 - Regime alignment with signal direction
 - Spread/volatility conditions (don't trade in wide-spread or extreme vol)
 - Fear & Greed contrarian signal (buy when others are fearful)
+- Fast mover detection (lower threshold for coins moving fast with volume)
 - Composite "edge score" that must exceed a threshold
 
 This is the guard that prevents the system from trading when there
@@ -35,18 +36,27 @@ class EdgeDecision:
     size_multiplier: float     # 0.0 to 1.0 (applied on top of vol sizing)
     reasons: List[str] = field(default_factory=list)
     details: Dict[str, float] = field(default_factory=dict)
+    max_concurrent_positions: int = 8  # F&G-aware position limit
 
 
 # ── Configuration ─────────────────────────────────────────────────────
 
 EDGE_THRESHOLD = 0.50          # minimum edge score to take trade (raised from 0.40)
 MIN_CONFIDENCE = 0.50          # model must be at least 50% confident (raised from 0.35)
-MAX_SPREAD_PCT = 0.3           # skip if spread > 0.3% (tighter, was 0.5%)
 AGREEMENT_BONUS = 0.15         # bonus when TCN + XGBoost agree
+
+# Spread filter: tightened for normal entries, relaxed for fast movers
+MAX_SPREAD_PCT = 0.25          # skip if spread > 0.25% for normal entries (relaxed from 0.15%)
+MAX_SPREAD_PCT_FAST_MOVER = 0.40  # allow up to 0.40% for fast movers
+
+# Fast mover detection thresholds
+FAST_MOVER_PRICE_CHANGE_PCT = 0.02   # 2%+ price change in window
+FAST_MOVER_VOLUME_RATIO_MIN = 1.5    # Volume must be increasing (1.5x+ normal)
+FAST_MOVER_EDGE_REDUCTION = 0.10     # Lower edge threshold by 10% for fast movers
 
 # Regime-based adjustments
 REGIME_EDGE_PENALTIES = {
-    "choppy": 0.30,            # need 30% more edge in chop (raised from 0.25)
+    "choppy": 0.10,            # 10% more edge in chop (lowered — system profits in chop with momentum TP)
     "high_vol": 0.20,          # need 20% more edge in high vol (raised from 0.15)
     "trending_up": 0.0,        # no penalty in trends
     "trending_down": 0.0,
@@ -81,6 +91,34 @@ FEAR_GREED_EDGE_BONUS = {
     "extreme_greed": -0.10,   # Strong penalty
 }
 
+# F&G-aware minimum confidence thresholds (overrides MIN_CONFIDENCE per zone)
+FEAR_GREED_MIN_CONFIDENCE = {
+    "extreme_fear":  0.55,   # Relaxed from 0.70 to allow more entries in extreme fear
+    "fear":          0.52,   # Relaxed from 0.60 to allow more entries in fear
+    "neutral":       0.50,   # Normal operation
+    "greed":         0.52,   # Relaxed from 0.60 to allow more entries in greed
+    "extreme_greed": 0.55,   # Relaxed from 0.70 to allow more entries in extreme greed
+}
+
+# F&G-aware max concurrent position limits
+FEAR_GREED_MAX_POSITIONS = {
+    "extreme_fear":  10,
+    "fear":          10,
+    "neutral":       12,
+    "greed":         8,
+    "extreme_greed": 6,
+}
+
+# Direction preference by F&G zone: positive = prefer longs, negative = prefer shorts
+# Applied as an extra confidence penalty for the disfavored direction
+FEAR_GREED_DIRECTION_PENALTY = {
+    "extreme_fear":  {"buy": 0.0,  "sell": 0.10},  # No extra penalty for buys in fear
+    "fear":          {"buy": 0.0,  "sell": 0.05},
+    "neutral":       {"buy": 0.0,  "sell": 0.0},
+    "greed":         {"buy": 0.05, "sell": 0.0},    # Penalize longs in greed
+    "extreme_greed": {"buy": 0.10, "sell": 0.0},    # Strong penalty for longs in extreme greed
+}
+
 # Feature quality weights (rebalanced to include fear/greed)
 WEIGHT_CONFIDENCE = 0.30
 WEIGHT_REGIME_FIT = 0.22
@@ -90,10 +128,27 @@ WEIGHT_AGREEMENT = 0.13
 WEIGHT_FEAR_GREED = 0.12     # New: contrarian sentiment weight
 
 
+def _detect_fast_mover(features: Dict[str, float]) -> bool:
+    """
+    Detect if a coin is a "fast mover" — significant price action with
+    increasing volume, indicating a move worth capturing.
+
+    Looks for 2%+ price change in the last 5 minutes with volume ratio >= 1.5x.
+    """
+    price_change_5m = abs(features.get("price_change_5m", 0.0))
+    volume_ratio_5m = features.get("volume_ratio_5m", features.get("volume_ratio", 1.0))
+
+    return (
+        price_change_5m >= FAST_MOVER_PRICE_CHANGE_PCT
+        and volume_ratio_5m >= FAST_MOVER_VOLUME_RATIO_MIN
+    )
+
+
 def evaluate_edge(
     prediction: dict,
     regime: RegimeState,
     features: Dict[str, float],
+    open_position_count: int = 0,
 ) -> EdgeDecision:
     """
     Evaluate whether a trade signal has enough edge to take.
@@ -108,6 +163,8 @@ def evaluate_edge(
         Current regime classification.
     features : dict
         Features from Redis (features:{symbol}).
+    open_position_count : int
+        Number of currently open positions (for F&G position limits).
 
     Returns
     -------
@@ -121,6 +178,15 @@ def evaluate_edge(
     reasons: List[str] = []
     details: Dict[str, float] = {}
 
+    # ── Fast mover detection ────────────────────────────────────────
+    is_fast_mover = _detect_fast_mover(features)
+    details["is_fast_mover"] = 1.0 if is_fast_mover else 0.0
+    if is_fast_mover:
+        reasons.append("fast_mover_detected")
+
+    # Choose spread limit based on fast mover status
+    active_max_spread = MAX_SPREAD_PCT_FAST_MOVER if is_fast_mover else MAX_SPREAD_PCT
+
     # ── 1. Model confidence score (0-1) ───────────────────────────────
     conf_score = min(1.0, confidence / 0.8)  # normalized: 80% confidence = 1.0
     details["confidence_raw"] = round(confidence, 3)
@@ -131,6 +197,56 @@ def evaluate_edge(
         return EdgeDecision(
             take=False, edge_score=conf_score * 0.3,
             size_multiplier=0.0, reasons=reasons, details=details,
+        )
+
+    # ── 1b. F&G-aware confidence gating ──────────────────────────────
+    # Determine F&G zone early for confidence and position limit checks
+    fear_greed_value = features.get("fear_greed_index", 50.0)
+    fg_zone_early = "neutral"
+    for zone_name, (low, high) in FEAR_GREED_ZONES.items():
+        if low <= fear_greed_value < high:
+            fg_zone_early = zone_name
+            break
+    if fear_greed_value >= 100:
+        fg_zone_early = "extreme_greed"
+
+    # Apply F&G-aware minimum confidence threshold
+    fg_min_confidence = FEAR_GREED_MIN_CONFIDENCE.get(fg_zone_early, MIN_CONFIDENCE)
+    details["fg_min_confidence"] = fg_min_confidence
+    details["fg_zone_early"] = fg_zone_early
+
+    # Apply direction-specific penalty (e.g., penalize longs in extreme greed)
+    direction_penalty = FEAR_GREED_DIRECTION_PENALTY.get(fg_zone_early, {})
+    normalized_dir = "buy" if direction in ("buy", "strong_buy") else "sell"
+    dir_penalty = direction_penalty.get(normalized_dir, 0.0)
+    effective_fg_confidence = fg_min_confidence + dir_penalty
+    details["fg_direction_penalty"] = dir_penalty
+    details["fg_effective_min_confidence"] = effective_fg_confidence
+
+    if confidence < effective_fg_confidence:
+        reasons.append(
+            f"fg_confidence_gate ({confidence:.2f} < {effective_fg_confidence:.2f}, "
+            f"zone={fg_zone_early}, dir={normalized_dir})"
+        )
+        return EdgeDecision(
+            take=False, edge_score=conf_score * 0.3,
+            size_multiplier=0.0, reasons=reasons, details=details,
+        )
+
+    # ── 1c. F&G-aware position limit check ────────────────────────────
+    max_positions = FEAR_GREED_MAX_POSITIONS.get(fg_zone_early, 8)
+    details["fg_max_positions"] = max_positions
+    details["open_position_count"] = open_position_count
+
+    if open_position_count >= max_positions:
+        reasons.append(
+            f"fg_position_limit ({open_position_count} >= {max_positions}, "
+            f"zone={fg_zone_early})"
+        )
+        return EdgeDecision(
+            take=False, edge_score=conf_score * 0.5,
+            size_multiplier=0.0, reasons=reasons, details=details,
+            max_concurrent_positions=max_positions,
         )
 
     # ── 2. Regime fit score (0-1) ─────────────────────────────────────
@@ -178,11 +294,12 @@ def evaluate_edge(
 
     # ── 4. Spread/cost score (0-1) ────────────────────────────────────
     spread_pct = features.get("spread_pct", 0.0)
-    if spread_pct > MAX_SPREAD_PCT:
+    details["max_spread_pct_used"] = round(active_max_spread, 4)
+    if spread_pct > active_max_spread:
         spread_score = 0.0
-        reasons.append(f"spread_too_wide ({spread_pct:.3f}%)")
+        reasons.append(f"spread_too_wide ({spread_pct:.3f}% > {active_max_spread:.3f}%)")
     elif spread_pct > 0:
-        spread_score = max(0.0, 1.0 - spread_pct / MAX_SPREAD_PCT)
+        spread_score = max(0.0, 1.0 - spread_pct / active_max_spread)
     else:
         spread_score = 0.8  # no spread data — assume OK but not perfect
 
@@ -247,6 +364,12 @@ def evaluate_edge(
     # Apply regime penalty + Fear & Greed threshold adjustment
     penalty = REGIME_EDGE_PENALTIES.get(regime.regime, 0.0)
     effective_threshold = EDGE_THRESHOLD + penalty + fg_threshold_adj
+
+    # Fast mover: lower the edge threshold to capture the move
+    if is_fast_mover:
+        effective_threshold -= FAST_MOVER_EDGE_REDUCTION
+        reasons.append(f"fast_mover_threshold_reduction (-{FAST_MOVER_EDGE_REDUCTION:.0%})")
+
     effective_threshold = max(0.20, effective_threshold)  # Floor: never go below 0.20
     details["edge_score_raw"] = round(edge_score, 4)
     details["regime_penalty"] = round(penalty, 3)
@@ -271,4 +394,5 @@ def evaluate_edge(
         size_multiplier=round(size_mult, 4),
         reasons=reasons,
         details=details,
+        max_concurrent_positions=max_positions,
     )

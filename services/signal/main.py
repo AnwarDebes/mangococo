@@ -35,7 +35,7 @@ from vol_sizing import calculate_vol_targeted_size, SizingResult
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "")
-CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", 0.55))
+CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", 0.50))
 STARTING_CAPITAL = float(os.getenv("STARTING_CAPITAL", 1000.0))
 MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", 0.50))
 MIN_POSITION_USD = float(os.getenv("MIN_POSITION_USD", 1.0))
@@ -55,7 +55,8 @@ CURRENT_REGIME = Gauge("signal_current_regime_score", "Current regime score", ["
 class Signal(BaseModel):
     signal_id: str
     symbol: str
-    action: str
+    action: str          # "buy" (long entry), "sell" (long exit), "short_entry", "short_exit"
+    side: str = "long"   # "long" or "short"
     amount: float
     price: float
     confidence: float
@@ -63,6 +64,7 @@ class Signal(BaseModel):
     regime: str = ""
     edge_score: float = 0.0
     vol_ratio: float = 1.0
+    reason: str = ""
 
 
 class Position(BaseModel):
@@ -72,8 +74,9 @@ class Position(BaseModel):
     entry_price: float
 
 
-# Per-symbol cooldown after a losing trade (prevents re-entering losers)
-LOSS_COOLDOWN_MINUTES = float(os.getenv("LOSS_COOLDOWN_MINUTES", 15))
+# Per-symbol graduated cooldown after losing trades (prevents re-entering losers)
+# 1st consecutive loss: 30 min, 2nd: 60 min, 3rd+: 120 min
+LOSS_COOLDOWN_GRADUATED = [30, 60, 120]  # minutes per consecutive loss tier
 # Require higher confidence to re-enter a symbol that recently lost
 LOSS_COOLDOWN_CONF_BOOST = float(os.getenv("LOSS_COOLDOWN_CONF_BOOST", 0.15))
 
@@ -83,6 +86,7 @@ current_positions: Dict[str, Position] = {}
 last_signals: Dict[str, Signal] = {}
 processed_signals: set = set()
 symbol_loss_cooldowns: Dict[str, datetime] = {}  # symbol → cooldown expiry time
+symbol_consecutive_losses: Dict[str, int] = {}   # symbol → consecutive loss count
 last_regime: Dict[str, RegimeState] = {}  # Track last regime per symbol
 
 
@@ -210,18 +214,38 @@ async def generate_signal(prediction: dict) -> Optional[Signal]:
         return None
 
     has_position = symbol in current_positions
+    current_side = current_positions[symbol].side if has_position else None
 
-    # Only buy if no position, only sell if have position
+    # Determine action based on direction and current position state
     if normalized_direction == "buy" and not has_position:
         action = "buy"
-    elif normalized_direction == "sell" and has_position:
+        signal_side = "long"
+    elif normalized_direction == "sell" and has_position and current_side == "long":
+        # v10: Block sell signals for losing positions — patience mode, wait for recovery
+        pos = current_positions[symbol]
+        if pos.entry_price > 0 and pos.current_price > 0:
+            pos_pnl_pct = (pos.current_price - pos.entry_price) / pos.entry_price
+            if pos_pnl_pct < 0:
+                logger.info("Sell signal BLOCKED — position in loss, patience mode",
+                            symbol=symbol, pnl_pct=f"{pos_pnl_pct:.4%}")
+                SIGNALS_SKIPPED.labels(reason="patience_block_loss").inc()
+                return None
         action = "sell"
+        signal_side = "long"
+    elif normalized_direction == "sell" and not has_position:
+        # SHORT ENTRY: bearish prediction with no open position
+        action = "short_entry"
+        signal_side = "short"
+    elif normalized_direction == "buy" and has_position and current_side == "short":
+        # SHORT EXIT: bullish prediction while holding a short
+        action = "short_exit"
+        signal_side = "short"
     else:
         SIGNALS_SKIPPED.labels(reason="no_action").inc()
         return None
 
     # Per-symbol loss cooldown: block re-entry after a losing trade
-    if action == "buy" and symbol in symbol_loss_cooldowns:
+    if action in ("buy", "short_entry") and symbol in symbol_loss_cooldowns:
         cooldown_expiry = symbol_loss_cooldowns[symbol]
         if datetime.utcnow() < cooldown_expiry:
             # During cooldown, require significantly higher confidence
@@ -256,7 +280,7 @@ async def generate_signal(prediction: dict) -> Optional[Signal]:
     }
     await redis_client.hset("regime_state", symbol, json.dumps(regime_data))
 
-    if action == "buy" and not regime_allows_entry(regime, normalized_direction):
+    if action in ("buy", "short_entry") and not regime_allows_entry(regime, normalized_direction):
         SIGNALS_SKIPPED.labels(reason="regime_blocked").inc()
         logger.info("Regime blocked entry",
                      symbol=symbol, direction=normalized_direction,
@@ -280,30 +304,89 @@ async def generate_signal(prediction: dict) -> Optional[Signal]:
     features["fear_greed_index"] = fear_greed_index
 
     # ══════════════════════════════════════════════════════════════════
+    # LAYER A.5: F&G-aware ensemble agreement filter (second layer)
+    # ══════════════════════════════════════════════════════════════════
+    fg_zone_signal = "neutral"
+    if fear_greed_index < 20:
+        fg_zone_signal = "extreme_fear"
+    elif fear_greed_index < 40:
+        fg_zone_signal = "fear"
+    elif fear_greed_index < 60:
+        fg_zone_signal = "neutral"
+    elif fear_greed_index < 80:
+        fg_zone_signal = "greed"
+    else:
+        fg_zone_signal = "extreme_greed"
+
+    agreement_bonus = float(breakdown.get("agreement_bonus", 0))
+    models_agree = agreement_bonus > 0
+
+    # In extreme fear or fear, require minimum confidence for long signals (relaxed: no model agreement required)
+    if action == "buy" and fg_zone_signal in ("extreme_fear", "fear") and confidence < 0.55:
+        SIGNALS_SKIPPED.labels(reason="fg_low_confidence_fear").inc()
+        logger.info("F&G filter blocked low-confidence long in fear zone",
+                     symbol=symbol, fear_greed=round(fear_greed_index, 1),
+                     confidence=round(confidence, 3), zone=fg_zone_signal)
+        return None
+
+    # F&G-aware SHORT entry gating:
+    # In extreme fear, the contrarian play is bullish → shorts need higher confidence (0.60+)
+    # In extreme greed, everyone is over-leveraged long → shorts are easier (0.50 confidence)
+    # In fear, shorts still need decent confidence (0.58+) since rebounds are common
+    if action == "short_entry":
+        if fg_zone_signal == "extreme_fear" and confidence < 0.60:
+            SIGNALS_SKIPPED.labels(reason="fg_short_extreme_fear").inc()
+            logger.info("F&G filter blocked short in extreme fear (contrarian bullish)",
+                         symbol=symbol, fear_greed=round(fear_greed_index, 1),
+                         confidence=round(confidence, 3))
+            return None
+        elif fg_zone_signal == "fear" and confidence < 0.58:
+            SIGNALS_SKIPPED.labels(reason="fg_short_fear").inc()
+            logger.info("F&G filter blocked low-confidence short in fear zone",
+                         symbol=symbol, fear_greed=round(fear_greed_index, 1),
+                         confidence=round(confidence, 3))
+            return None
+        elif fg_zone_signal == "extreme_greed" and confidence < 0.50:
+            SIGNALS_SKIPPED.labels(reason="fg_short_low_conf").inc()
+            logger.info("F&G filter blocked very low confidence short in extreme greed",
+                         symbol=symbol, fear_greed=round(fear_greed_index, 1),
+                         confidence=round(confidence, 3))
+            return None
+        elif fg_zone_signal in ("neutral", "greed") and confidence < 0.55:
+            SIGNALS_SKIPPED.labels(reason="fg_short_neutral_low_conf").inc()
+            logger.info("F&G filter blocked low-confidence short",
+                         symbol=symbol, fear_greed=round(fear_greed_index, 1),
+                         confidence=round(confidence, 3), zone=fg_zone_signal)
+            return None
+
+    # ══════════════════════════════════════════════════════════════════
     # LAYER B: Edge Gate
     # ══════════════════════════════════════════════════════════════════
-    if action == "buy":  # only gate entries, not exits
-        edge = evaluate_edge(prediction, regime, features)
+    if action in ("buy", "short_entry"):  # gate all entries, not exits
+        edge = evaluate_edge(prediction, regime, features,
+                             open_position_count=len(current_positions))
         EDGE_GATE_DECISIONS.labels(decision="take" if edge.take else "skip").inc()
 
         if not edge.take:
             SIGNALS_SKIPPED.labels(reason="edge_gate_skip").inc()
             logger.info("Edge gate blocked entry",
                          symbol=symbol, edge_score=edge.edge_score,
-                         reasons=edge.reasons, regime=regime.regime)
+                         reasons=edge.reasons, regime=regime.regime,
+                         side=signal_side)
             return None
 
         logger.info("Edge gate approved",
                      symbol=symbol, edge_score=edge.edge_score,
                      size_mult=edge.size_multiplier,
-                     reasons=edge.reasons, regime=regime.regime)
+                     reasons=edge.reasons, regime=regime.regime,
+                     side=signal_side)
     else:
-        edge = None  # sell signals pass through (exit managed by position manager)
+        edge = None  # exit signals pass through (exit managed by position manager)
 
     # ══════════════════════════════════════════════════════════════════
     # LAYER C: Dynamic Adaptive Sizing
     # ══════════════════════════════════════════════════════════════════
-    if action == "buy":
+    if action in ("buy", "short_entry"):
         available = await _get_available_capital()
         MIN_TRADE_VALUE = 5.0
         if available < MIN_TRADE_VALUE:
@@ -380,16 +463,82 @@ async def generate_signal(prediction: dict) -> Optional[Signal]:
                      streak_mult=sizing.details.get("streak_multiplier", 1.0),
                      dd_scale=sizing.details.get("drawdown_scale", 1.0))
     else:
-        # Sell: use position amount
+        # Exit (sell long or close short): use position amount
         amount = current_positions[symbol].amount
+
+    # Build descriptive reason based on signal context
+    if action == "sell":
+        signal_reason = "signal_sell_exit"
+    elif action == "short_exit":
+        signal_reason = "signal_short_cover"
+    else:
+        # Determine reason from prediction breakdown and model signals
+        reason_parts = []
+        tcn_conf = _safe_float(breakdown.get("tcn_confidence"), 0.0)
+        xgb_conf = _safe_float(breakdown.get("xgb_confidence"), 0.0)
+        ensemble_conf = _safe_float(breakdown.get("ensemble_confidence"), 0.0)
+
+        is_short = (action == "short_entry")
+
+        if is_short:
+            # SHORT entry reasons
+            if tcn_conf >= 0.6:
+                reason_parts.append("tcn_strong_sell")
+            elif tcn_conf >= 0.4:
+                reason_parts.append("tcn_sell")
+
+            if xgb_conf >= 0.6:
+                reason_parts.append("xgb_bearish_momentum")
+            elif xgb_conf >= 0.4:
+                reason_parts.append("xgb_bearish_signal")
+
+            if ensemble_conf >= 0.6 or (not reason_parts and confidence >= 0.6):
+                reason_parts.append("ensemble_bearish")
+
+            if direction == "strong_sell":
+                reason_parts.append("strong_short_conviction")
+
+            if regime.regime == "trending_down":
+                reason_parts.append("downtrend_aligned")
+            elif regime.regime == "mean_reverting":
+                reason_parts.append("mean_revert_short")
+        else:
+            # LONG entry reasons
+            if tcn_conf >= 0.6:
+                reason_parts.append("tcn_strong_buy")
+            elif tcn_conf >= 0.4:
+                reason_parts.append("tcn_buy")
+
+            if xgb_conf >= 0.6:
+                reason_parts.append("xgb_momentum")
+            elif xgb_conf >= 0.4:
+                reason_parts.append("xgb_signal")
+
+            if ensemble_conf >= 0.6 or (not reason_parts and confidence >= 0.6):
+                reason_parts.append("ensemble_bullish")
+
+            if direction == "strong_buy":
+                reason_parts.append("strong_conviction")
+
+            if regime.regime == "trending":
+                reason_parts.append("trend_aligned")
+            elif regime.regime == "mean_reverting":
+                reason_parts.append("mean_revert")
+
+        if edge and edge.edge_score >= 0.7:
+            reason_parts.append("high_edge")
+
+        signal_reason = "_".join(reason_parts) if reason_parts else f"ml_{direction}_conf{confidence:.0%}"
 
     signal = Signal(
         signal_id=str(uuid.uuid4())[:8], symbol=symbol, action=action,
+        side=signal_side,
         amount=amount, price=current_price, confidence=confidence,
         timestamp=datetime.utcnow().isoformat(),
         regime=regime.regime,
         edge_score=edge.edge_score if edge else 0.0,
         vol_ratio=regime.volatility_ratio,
+        reason=signal_reason,
     )
 
     SIGNALS_GENERATED.labels(symbol=symbol, action=action).inc()
@@ -401,7 +550,7 @@ async def generate_signal(prediction: dict) -> Optional[Signal]:
 
     logger.info("SIGNAL GENERATED (3-layer approved)",
                 signal_id=signal.signal_id, symbol=symbol, action=action,
-                regime=regime.regime, edge_score=signal.edge_score,
+                reason=signal_reason, regime=regime.regime, edge_score=signal.edge_score,
                 vol_ratio=signal.vol_ratio, amount=round(amount, 4))
 
     return signal
@@ -444,14 +593,24 @@ async def listen_for_position_updates():
                     current_positions[symbol] = Position(**json.loads(pos_data))
             else:
                 current_positions.pop(symbol, None)
-                # Track losing trades for cooldown
+                # Track losing trades for graduated cooldown
                 pnl = data.get("pnl", 0)
                 if pnl < 0:
-                    cooldown_until = datetime.utcnow() + timedelta(minutes=LOSS_COOLDOWN_MINUTES)
+                    # Increment consecutive loss count for this symbol
+                    symbol_consecutive_losses[symbol] = symbol_consecutive_losses.get(symbol, 0) + 1
+                    loss_count = symbol_consecutive_losses[symbol]
+                    # Graduated cooldown: 30 min (1st), 60 min (2nd), 120 min (3rd+)
+                    tier_index = min(loss_count - 1, len(LOSS_COOLDOWN_GRADUATED) - 1)
+                    cooldown_minutes = LOSS_COOLDOWN_GRADUATED[tier_index]
+                    cooldown_until = datetime.utcnow() + timedelta(minutes=cooldown_minutes)
                     symbol_loss_cooldowns[symbol] = cooldown_until
-                    logger.info("Loss cooldown set",
+                    logger.info("Graduated loss cooldown set",
                                 symbol=symbol, pnl=f"{pnl:.2f}",
-                                cooldown_minutes=LOSS_COOLDOWN_MINUTES)
+                                consecutive_losses=loss_count,
+                                cooldown_minutes=cooldown_minutes)
+                else:
+                    # Winning trade resets consecutive loss counter
+                    symbol_consecutive_losses.pop(symbol, None)
 
 
 async def sync_balance_from_mexc():
@@ -517,6 +676,24 @@ async def lifespan(app: FastAPI):
         if pos.get("status") == "open":
             current_positions[symbol] = Position(**pos)
 
+    # v10: Initialize loss cooldowns from trade history on startup
+    try:
+        recent_trades = await redis_client.lrange("trade_history", 0, 49)
+        from collections import defaultdict
+        sym_losses = defaultdict(int)
+        for t in recent_trades:
+            d = json.loads(t)
+            if d.get("realized_pnl", 0) < -0.5:  # Significant loss
+                sym_losses[d["symbol"]] += 1
+        for sym, count in sym_losses.items():
+            tier = min(count - 1, len(LOSS_COOLDOWN_GRADUATED) - 1)
+            cooldown_min = LOSS_COOLDOWN_GRADUATED[tier] * count  # Scale by number of losses
+            symbol_loss_cooldowns[sym] = datetime.utcnow() + timedelta(minutes=cooldown_min)
+            symbol_consecutive_losses[sym] = count
+            logger.info(f"Initialized cooldown for {sym}: {cooldown_min}min ({count} losses)")
+    except Exception as e:
+        logger.warning("Failed to initialize loss cooldowns", error=str(e))
+
     pred_task = asyncio.create_task(listen_for_predictions())
     pos_task = asyncio.create_task(listen_for_position_updates())
 
@@ -570,7 +747,8 @@ async def create_manual_signal(symbol: str, action: str, amount: float):
     tick = json.loads(tick)
     signal = Signal(
         signal_id=f"manual-{str(uuid.uuid4())[:4]}", symbol=symbol, action=action,
-        amount=amount, price=tick["price"], confidence=1.0, timestamp=datetime.utcnow().isoformat()
+        amount=amount, price=tick["price"], confidence=1.0, timestamp=datetime.utcnow().isoformat(),
+        reason="manual_trade",
     )
     await redis_client.publish("raw_signals", signal.model_dump_json())
     return signal

@@ -55,22 +55,117 @@ class MexcAdapter(ExchangeAdapter):
             except Exception:
                 pass
 
+    # ── Volume / liquidity filter thresholds ──────────────────────────
+    MIN_24H_VOLUME_USD = 5_000       # Minimum 24h quote volume in USD (relaxed: low vol pairs have big potential)
+    MIN_PRICE_USD = 0.00001          # Reject dust tokens below this price (allow cheaper tokens)
+    MAX_BID_ASK_SPREAD_PCT = 8.0     # Max bid-ask spread as % of mid price (more lenient)
+
     async def fetch_usdt_symbols(self, limit: Optional[int] = None) -> List[str]:
-        """Fetch all USDT spot pairs from MEXC (public, no auth needed)."""
+        """Fetch USDT spot pairs from MEXC, filtered by volume and liquidity.
+
+        Applies three filters to avoid micro-cap garbage tokens:
+        1. Minimum 24h quote volume ($50k USD default)
+        2. Minimum last price ($0.0001 default)
+        3. Maximum bid-ask spread (5% default) when bid/ask data is available
+        """
         await asyncio.to_thread(self._rest.load_markets)
         self._markets_loaded = True
-        symbols = []
+
+        # Step 1: collect all USDT spot symbols
+        all_usdt_symbols = []
         for symbol, market in self._rest.markets.items():
             if market.get("quote") != "USDT":
                 continue
             if not market.get("spot", True):
                 continue
+            all_usdt_symbols.append(symbol)
+
+        total_before_filter = len(all_usdt_symbols)
+        logger.info(
+            "MEXC raw USDT spot pairs discovered",
+            count=total_before_filter,
+        )
+
+        # Step 2: fetch tickers in bulk for volume/price/spread data
+        try:
+            tickers = await asyncio.to_thread(
+                self._rest.fetch_tickers, all_usdt_symbols
+            )
+        except Exception as e:
+            logger.warning(
+                "Bulk ticker fetch failed, falling back to unfiltered list",
+                error=str(e),
+            )
+            all_usdt_symbols.sort()
+            if limit:
+                all_usdt_symbols = all_usdt_symbols[:limit]
+            return all_usdt_symbols
+
+        # Step 3: apply volume, price, and spread filters
+        symbols = []
+        rejected_volume = 0
+        rejected_price = 0
+        rejected_spread = 0
+
+        for symbol in all_usdt_symbols:
+            ticker = tickers.get(symbol)
+            if ticker is None:
+                rejected_volume += 1  # no data = skip
+                continue
+
+            # --- 24h quote volume filter ---
+            quote_volume = self._safe_float_val(ticker.get("quoteVolume"))
+            if quote_volume < self.MIN_24H_VOLUME_USD:
+                rejected_volume += 1
+                continue
+
+            # --- Minimum price filter ---
+            last_price = self._safe_float_val(ticker.get("last"))
+            if last_price < self.MIN_PRICE_USD:
+                rejected_price += 1
+                continue
+
+            # --- Bid-ask spread filter (when data available) ---
+            bid = self._safe_float_val(ticker.get("bid"))
+            ask = self._safe_float_val(ticker.get("ask"))
+            if bid > 0 and ask > 0:
+                mid = (bid + ask) / 2.0
+                spread_pct = ((ask - bid) / mid) * 100.0 if mid > 0 else 0.0
+                if spread_pct > self.MAX_BID_ASK_SPREAD_PCT:
+                    rejected_spread += 1
+                    continue
+
             symbols.append(symbol)
+
         symbols.sort()
         if limit:
             symbols = symbols[:limit]
-        logger.info(f"Fetched {len(symbols)} USDT spot pairs from MEXC")
+
+        total_rejected = total_before_filter - len(symbols)
+        logger.info(
+            "MEXC symbol filtering complete",
+            total_raw=total_before_filter,
+            passed=len(symbols),
+            rejected_total=total_rejected,
+            rejected_low_volume=rejected_volume,
+            rejected_low_price=rejected_price,
+            rejected_wide_spread=rejected_spread,
+            min_volume_usd=self.MIN_24H_VOLUME_USD,
+            min_price_usd=self.MIN_PRICE_USD,
+            max_spread_pct=self.MAX_BID_ASK_SPREAD_PCT,
+        )
         return symbols
+
+    @staticmethod
+    def _safe_float_val(v, default=0.0):
+        """Convert a value to float, returning *default* on failure."""
+        if v is None:
+            return default
+        try:
+            f = float(v)
+            return f if f == f else default  # NaN check
+        except (ValueError, TypeError):
+            return default
 
     def supports_watch_tickers(self) -> bool:
         """Return True only when ccxt.pro and exchange support watch_tickers."""

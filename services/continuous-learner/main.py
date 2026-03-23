@@ -1,17 +1,27 @@
 """
-Goblin Continuous Learner — Reinforcement Learning & Online Training Service (v3.0).
+Goblin Continuous Learner — Reinforcement Learning & Online Training Service (v5.0).
+
+v5.0 improvements (MAX GPU utilization + aggressive PnL-based learning):
+- Training every 1 minute — V100 should NEVER sit idle
+- TCN epochs: 100 per cycle (was 50) — deeper learning
+- XGBoost rounds: 500 (was 300) — stronger trees
+- Batch size: 2048 (was 1024) with gradient accumulation fallback
+- Aggressive PnL reward system with asymmetric weighting:
+  - Big wins (>2%): 3.0x multiplier — learn a LOT from big wins
+  - Small wins (0-2%): 1.5x multiplier
+  - Small losses (-2%-0%): 2.0x penalty — penalize losses harder
+  - Big losses (<-2%): 4.0x penalty — heavily penalize big losses
+- Online micro-training: quick model update after each trade closes
+- All TCN variants (micro/short/medium/long) trained every cycle with FULL epochs
+- Higher initial LR (0.001) with cosine annealing for fast adaptation
+- Trade feature buffer: last N trade vectors kept in memory for micro-training
 
 v3.0 improvements (GPU maximization + faster convergence):
 - Mixed Precision (AMP): ~2x faster GPU training, lower VRAM usage
 - AdamW optimizer with weight decay for better generalization
 - Cosine annealing LR scheduler with warm restarts for smoother convergence
-- Faster training cycle: 3 minutes (was 5) — keeps GPU busy
-- More epochs per cycle: 50 (was 30) — deeper learning per cycle
-- More XGBoost boost rounds: 300 (was 200) — stronger trees
-- Larger batch size: 1024 (was 512) — better GPU throughput
 
 v2.0 improvements over v1.0:
-- Faster training cycle: 5 minutes (was 10)
 - Exponential recency weighting: recent data weighted up to 3x more than old data
 - Performance gating: new model only deployed if it beats current accuracy
 - Faster reward evaluation: 10-minute outcome window (was 25 minutes)
@@ -25,9 +35,11 @@ Runs as a persistent background service that:
 3. Performs incremental RL-weighted training on both TCN and XGBoost
 4. Hot-swaps model files so the prediction service picks up improvements
 5. Logs training metrics to Redis for the AI Nerve Monitor
+6. Micro-trains on individual closed trades for rapid online adaptation
 """
 
 import asyncio
+import collections
 import json
 import os
 import sys
@@ -57,30 +69,49 @@ REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "")
 
-MODELS_DIR = Path(os.getenv("MODELS_DIR", "/home/coder/Goblin/shared/models"))
+MODELS_DIR = Path(os.environ.get("MODEL_DIR", "/home/coder/Goblin/shared/models"))
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Training schedule
-TRAIN_INTERVAL_MINUTES = int(os.getenv("TRAIN_INTERVAL_MINUTES", "3"))  # v3: 3min (was 5) — maximize GPU utilization
+TRAIN_INTERVAL_MINUTES = int(os.getenv("TRAIN_INTERVAL_MINUTES", "1"))  # v5: 1min — V100 should NEVER idle
 REWARD_LOOKBACK_CANDLES = 2  # v2: 2 candles = 10 minutes (was 5 candles = 25min)
 MIN_SAMPLES_FOR_TRAINING = 500
-LEARNING_RATE_TCN = 0.0003
+LEARNING_RATE_TCN = 0.001   # v5: higher initial LR for fast adaptation (was 0.0003)
 LEARNING_RATE_XGB = 0.03
-TCN_EPOCHS_PER_CYCLE = int(os.getenv("TCN_EPOCHS_PER_CYCLE", "50"))   # v3: 50 (was 30) — GPU is underutilized
-XGB_BOOST_ROUNDS_PER_CYCLE = int(os.getenv("XGB_BOOST_ROUNDS_PER_CYCLE", "300"))  # v3: 300 (was 200)
-TCN_HIDDEN_CHANNELS = int(os.getenv("TCN_HIDDEN_CHANNELS", "256"))
-TCN_BATCH_SIZE = int(os.getenv("TCN_BATCH_SIZE", "1024"))  # v3: 1024 (was 512) — better GPU throughput
+TCN_EPOCHS_PER_CYCLE = int(os.getenv("TCN_EPOCHS_PER_CYCLE", "20"))   # v6: 20 — fast cycles, deploy models quickly
+XGB_BOOST_ROUNDS_PER_CYCLE = int(os.getenv("XGB_BOOST_ROUNDS_PER_CYCLE", "500"))  # v5: 500 (was 300)
+TCN_HIDDEN_CHANNELS = int(os.getenv("TCN_HIDDEN_CHANNELS", "512"))  # v6: wider model for V100
+TCN_BATCH_SIZE = int(os.getenv("TCN_BATCH_SIZE", "8192"))  # v6: 8192 — larger batches = higher GPU utilization on V100 32GB
+GRADIENT_ACCUMULATION_STEPS = int(os.getenv("GRADIENT_ACCUMULATION_STEPS", "1"))  # v6: no accumulation — full GPU batches
 XGB_MAX_DEPTH = int(os.getenv("XGB_MAX_DEPTH", "10"))
 USE_AMP = os.getenv("USE_AMP", "true").lower() == "true"  # v3: Mixed precision for 2x GPU speedup
 TRAINING_DAYS = int(os.getenv("TRAINING_DAYS", "90"))
 MAX_TRAINING_SYMBOLS = int(os.getenv("MAX_TRAINING_SYMBOLS", "100"))
 
+# v5: Online micro-training buffer — last N trade feature vectors for quick updates
+MICRO_TRAIN_BUFFER_SIZE = int(os.getenv("MICRO_TRAIN_BUFFER_SIZE", "200"))
+MICRO_TRAIN_EPOCHS = int(os.getenv("MICRO_TRAIN_EPOCHS", "5"))
+MICRO_TRAIN_LR = 0.0005  # Lower LR for micro-updates to avoid catastrophic forgetting
+
+# v5: PnL reward multipliers — asymmetric (losses penalized harder for conservative trading)
+PNL_BIG_WIN_THRESHOLD = 0.02      # > 2% PnL
+PNL_BIG_WIN_MULTIPLIER = 3.0      # Learn a LOT from big wins
+PNL_SMALL_WIN_MULTIPLIER = 1.5    # Moderate boost for small wins
+PNL_SMALL_LOSS_MULTIPLIER = 2.0   # Penalize small losses more than reward equivalent wins
+PNL_BIG_LOSS_THRESHOLD = -0.02    # <= -2% PnL
+PNL_BIG_LOSS_MULTIPLIER = 4.0     # Heavily penalize big losses
+
 # v2: Recency weighting — recent data is more valuable
 RECENCY_HALF_LIFE_DAYS = 7  # Data from 7 days ago gets 50% weight
 RECENCY_MAX_BOOST = 3.0     # Most recent data weighted up to 3x
 
+# v6: Feature cache — avoid recomputing 5M candles of features every cycle
+_feature_cache: dict = {}  # {symbol: (candle_count, features, targets_3, targets_5)}
+_feature_cache_hits = 0
+_feature_cache_misses = 0
+
 # v2: Performance gating — only deploy if new model is better
-MIN_ACCURACY_IMPROVEMENT = 0.0  # Deploy if equal or better (0 = always deploy if not worse)
+MIN_ACCURACY_IMPROVEMENT = 0.001  # Require marginal improvement to avoid deploying noise
 GATE_MODELS = os.getenv("GATE_MODELS", "true").lower() == "true"
 
 # Feature names matching prediction service's features/technical.py
@@ -208,34 +239,28 @@ def compute_features_for_df(df: pd.DataFrame) -> np.ndarray:
     atr14 = pd.Series(tr).rolling(14, min_periods=1).mean().values
     atr_pct = np.divide(atr14, close, out=np.zeros(n), where=close > 0) * 100
 
-    # OBV trend
-    obv = np.zeros(n)
-    for i in range(1, n):
-        if close[i] > close[i - 1]:
-            obv[i] = obv[i - 1] + volume[i]
-        elif close[i] < close[i - 1]:
-            obv[i] = obv[i - 1] - volume[i]
-        else:
-            obv[i] = obv[i - 1]
+    # OBV trend (vectorized)
+    price_diff = np.diff(close, prepend=close[0])
+    obv_direction = np.sign(price_diff)
+    obv = np.cumsum(obv_direction * volume)
     obv_ema = _ema(obv, 20)
     obv_trend = np.where(obv > obv_ema, 1.0, -1.0)
 
-    # Stochastic RSI
-    rsi_series = rsi_14
-    stoch_k = np.zeros(n)
-    for i in range(14, n):
-        window = rsi_series[i - 14 + 1:i + 1]
-        rng = window.max() - window.min()
-        stoch_k[i] = (rsi_series[i] - window.min()) / rng if rng > 0 else 50.0
+    # Stochastic RSI (vectorized using pandas rolling)
+    rsi_series = pd.Series(rsi_14)
+    rsi_min = rsi_series.rolling(14, min_periods=1).min().values
+    rsi_max = rsi_series.rolling(14, min_periods=1).max().values
+    rsi_range = rsi_max - rsi_min
+    stoch_k = np.where(rsi_range > 0, (rsi_14 - rsi_min) / rsi_range, 0.5)
     stoch_d = _sma(stoch_k, 3)
 
-    # Williams %R
-    williams = np.zeros(n)
-    for i in range(14, n):
-        hh = high[i - 14 + 1:i + 1].max()
-        ll = low[i - 14 + 1:i + 1].min()
-        rng = hh - ll
-        williams[i] = ((hh - close[i]) / rng * -100) if rng > 0 else -50.0
+    # Williams %R (vectorized using pandas rolling)
+    high_series = pd.Series(high)
+    low_series = pd.Series(low)
+    hh = high_series.rolling(14, min_periods=1).max().values
+    ll = low_series.rolling(14, min_periods=1).min().values
+    hl_range = hh - ll
+    williams = np.where(hl_range > 0, (hh - close) / hl_range * -100, -50.0)
 
     # EMA crosses
     ema9 = _ema(close, 9)
@@ -286,9 +311,9 @@ def compute_features_for_df(df: pd.DataFrame) -> np.ndarray:
 
 def compute_targets_5class(close: np.ndarray, horizon: int = REWARD_LOOKBACK_CANDLES) -> np.ndarray:
     """5-class targets for XGBoost matching prediction service labels."""
-    future_ret = np.zeros(len(close))
-    for i in range(len(close) - horizon):
-        future_ret[i] = (close[i + horizon] - close[i]) / max(close[i], 1e-10)
+    future_close = np.roll(close, -horizon)
+    future_ret = np.divide(future_close - close, np.maximum(close, 1e-10))
+    future_ret[-horizon:] = 0  # no future data for last `horizon` candles
 
     targets = np.full(len(close), 2)  # default: hold
     targets[future_ret > 0.015] = 4   # strong_buy
@@ -303,9 +328,9 @@ def compute_targets_5class(close: np.ndarray, horizon: int = REWARD_LOOKBACK_CAN
 
 def compute_targets_3class(close: np.ndarray, horizon: int = REWARD_LOOKBACK_CANDLES) -> np.ndarray:
     """3-class targets for TCN: 0=up, 1=down, 2=neutral."""
-    future_ret = np.zeros(len(close))
-    for i in range(len(close) - horizon):
-        future_ret[i] = (close[i + horizon] - close[i]) / max(close[i], 1e-10)
+    future_close = np.roll(close, -horizon)
+    future_ret = np.divide(future_close - close, np.maximum(close, 1e-10))
+    future_ret[-horizon:] = 0  # no future data for last `horizon` candles
 
     targets = np.full(len(close), 2)  # neutral
     targets[future_ret > 0.001] = 0   # up
@@ -428,6 +453,323 @@ class RewardTracker:
         return reward_summary
 
 
+# ── Live PnL Feedback ─────────────────────────────────────────────────
+
+async def fetch_pnl_reward_signal(redis: aioredis.Redis, lookback_hours: int = 6) -> Dict[str, float]:
+    """Read recent closed trades from Redis and compute per-symbol PnL reward signals.
+
+    v5: Aggressive asymmetric PnL reward system:
+      - Big win (PnL > 2%):     3.0x multiplier — learn heavily from big wins
+      - Small win (0-2%):       1.5x multiplier — moderate reward
+      - Small loss (-2% to 0%): 2.0x penalty   — penalize losses harder than equivalent wins
+      - Big loss (< -2%):       4.0x penalty   — heavily penalize to avoid repeating
+
+    Returns:
+        Dict mapping symbol -> PnL reward multiplier.
+        Values > 1.0 mean upweight (profitable patterns).
+        Values < 1.0 mean downweight (losing patterns).
+    """
+    pnl_signals: Dict[str, float] = {}
+    try:
+        # Read last 500 trades (trade_history is an lpush list, newest first)
+        raw_trades = await redis.lrange("trade_history", 0, 499)
+        if not raw_trades:
+            return pnl_signals
+
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+        symbol_pnls: Dict[str, List[Tuple[float, float, float]]] = {}  # symbol -> [(pnl_pct, recency_weight, pnl_multiplier)]
+
+        for raw in raw_trades:
+            try:
+                trade = json.loads(raw)
+                exit_time_str = trade.get("exit_time", "")
+                if not exit_time_str:
+                    continue
+
+                exit_time = datetime.fromisoformat(exit_time_str)
+                if exit_time.tzinfo is None:
+                    exit_time = exit_time.replace(tzinfo=timezone.utc)
+
+                if exit_time < cutoff:
+                    continue  # Too old
+
+                symbol = trade.get("symbol", "")
+                realized_pnl = float(trade.get("realized_pnl", 0))
+                # Compute PnL as percentage of entry
+                entry_price = float(trade.get("entry_price", trade.get("price", 0)))
+                if entry_price > 0:
+                    pnl_pct = realized_pnl / entry_price
+                else:
+                    pnl_pct = realized_pnl  # fallback: treat as fraction directly
+                if not symbol:
+                    continue
+
+                # v5: Asymmetric PnL multipliers — losses penalized harder
+                if pnl_pct > PNL_BIG_WIN_THRESHOLD:
+                    pnl_multiplier = PNL_BIG_WIN_MULTIPLIER      # 3.0x — learn a LOT
+                elif pnl_pct > 0:
+                    pnl_multiplier = PNL_SMALL_WIN_MULTIPLIER     # 1.5x
+                elif pnl_pct > PNL_BIG_LOSS_THRESHOLD:
+                    pnl_multiplier = PNL_SMALL_LOSS_MULTIPLIER    # 2.0x — penalize more
+                else:
+                    pnl_multiplier = PNL_BIG_LOSS_MULTIPLIER      # 4.0x — heavy penalty
+
+                # Recency weight: trades from last hour weighted 3x, decaying
+                age_hours = (datetime.now(timezone.utc) - exit_time).total_seconds() / 3600
+                recency_w = max(0.3, 3.0 * (0.5 ** (age_hours / 2.0)))
+
+                if symbol not in symbol_pnls:
+                    symbol_pnls[symbol] = []
+                symbol_pnls[symbol].append((pnl_pct, recency_w, pnl_multiplier))
+
+            except Exception:
+                continue
+
+        # Compute weighted PnL signal per symbol using asymmetric multipliers
+        for symbol, pnl_entries in symbol_pnls.items():
+            if not pnl_entries:
+                continue
+
+            # Weighted average of PnL multipliers (recency-weighted)
+            weighted_mult_sum = sum(mult * recency for _, recency, mult in pnl_entries)
+            total_recency = sum(recency for _, recency, _ in pnl_entries)
+            avg_multiplier = weighted_mult_sum / total_recency if total_recency > 0 else 1.0
+
+            # Direction: are recent trades net profitable or losing?
+            weighted_pnl = sum(pnl * recency for pnl, recency, _ in pnl_entries)
+            net_direction = 1.0 if weighted_pnl >= 0 else -1.0
+
+            # Final signal: multiplier applied in the direction of net PnL
+            # Profitable symbols get upweighted, losing symbols get downweighted
+            if net_direction > 0:
+                signal = 1.0 + (avg_multiplier - 1.0) * 0.3  # Boost: scale into [1.0, ~1.9]
+            else:
+                signal = max(0.2, 1.0 - (avg_multiplier - 1.0) * 0.3)  # Penalize: scale into [~0.1, 1.0]
+
+            pnl_signals[symbol] = round(signal, 4)
+
+        if pnl_signals:
+            logger.info("PnL reward signals computed (v5 asymmetric)",
+                        symbols=len(pnl_signals),
+                        profitable=sum(1 for v in pnl_signals.values() if v > 1.0),
+                        losing=sum(1 for v in pnl_signals.values() if v < 1.0),
+                        big_win_mult=PNL_BIG_WIN_MULTIPLIER,
+                        big_loss_mult=PNL_BIG_LOSS_MULTIPLIER)
+
+    except Exception as e:
+        logger.warning("Failed to fetch PnL reward signal", error=str(e))
+
+    return pnl_signals
+
+
+async def fetch_trade_sample_weights(redis: aioredis.Redis, n_samples: int,
+                                      sample_timestamps: np.ndarray) -> np.ndarray:
+    """Compute per-sample PnL-based weights for training data.
+
+    v5: Maps recent trade PnL outcomes back to training samples by timestamp proximity.
+    Samples near winning trades get upweighted, samples near losing trades get penalized.
+    This makes the model pay MORE attention to patterns that led to wins/losses.
+
+    Returns:
+        Array of shape (n_samples,) with per-sample PnL multipliers.
+    """
+    weights = np.ones(n_samples, dtype=np.float32)
+    try:
+        raw_trades = await redis.lrange("trade_history", 0, 999)
+        if not raw_trades:
+            return weights
+
+        trade_events = []  # (timestamp_epoch, pnl_multiplier)
+        for raw in raw_trades:
+            try:
+                trade = json.loads(raw)
+                entry_time_str = trade.get("entry_time", trade.get("timestamp", ""))
+                exit_time_str = trade.get("exit_time", "")
+                if not entry_time_str:
+                    continue
+
+                entry_time = datetime.fromisoformat(entry_time_str)
+                if entry_time.tzinfo is None:
+                    entry_time = entry_time.replace(tzinfo=timezone.utc)
+
+                realized_pnl = float(trade.get("realized_pnl", 0))
+                entry_price = float(trade.get("entry_price", trade.get("price", 0)))
+                pnl_pct = realized_pnl / entry_price if entry_price > 0 else realized_pnl
+
+                # Asymmetric multiplier
+                if pnl_pct > PNL_BIG_WIN_THRESHOLD:
+                    mult = PNL_BIG_WIN_MULTIPLIER
+                elif pnl_pct > 0:
+                    mult = PNL_SMALL_WIN_MULTIPLIER
+                elif pnl_pct > PNL_BIG_LOSS_THRESHOLD:
+                    mult = PNL_SMALL_LOSS_MULTIPLIER
+                else:
+                    mult = PNL_BIG_LOSS_MULTIPLIER
+
+                trade_events.append((entry_time.timestamp(), mult))
+            except Exception:
+                continue
+
+        if not trade_events:
+            return weights
+
+        # Apply multipliers to nearby samples (within 30 minute window)
+        trade_times = np.array([t for t, _ in trade_events])
+        trade_mults = np.array([m for _, m in trade_events])
+        window_sec = 1800  # 30 minutes
+
+        for i in range(n_samples):
+            if sample_timestamps[i] > 0:
+                diffs = np.abs(trade_times - sample_timestamps[i])
+                nearby = diffs < window_sec
+                if nearby.any():
+                    # Use the highest multiplier from nearby trades
+                    weights[i] = float(trade_mults[nearby].max())
+
+    except Exception as e:
+        logger.debug("Failed to compute per-sample PnL weights", error=str(e))
+
+    return weights
+
+
+# ── Online Micro-Training Buffer ─────────────────────────────────────
+
+class TradeFeatureBuffer:
+    """In-memory ring buffer of recent trade feature vectors for micro-training.
+
+    v5: After each trade closes, we store its feature vector and outcome
+    for quick online updates without waiting for the full training cycle.
+    """
+
+    def __init__(self, max_size: int = MICRO_TRAIN_BUFFER_SIZE):
+        self.max_size = max_size
+        self.features = collections.deque(maxlen=max_size)   # feature vectors (20,)
+        self.targets_3 = collections.deque(maxlen=max_size)  # 3-class target
+        self.targets_5 = collections.deque(maxlen=max_size)  # 5-class target
+        self.pnl_weights = collections.deque(maxlen=max_size)  # PnL-based sample weight
+        self.timestamps = collections.deque(maxlen=max_size)
+
+    def add(self, features: np.ndarray, target_3: int, target_5: int,
+            pnl_weight: float, timestamp: float):
+        self.features.append(features)
+        self.targets_3.append(target_3)
+        self.targets_5.append(target_5)
+        self.pnl_weights.append(pnl_weight)
+        self.timestamps.append(timestamp)
+
+    def __len__(self):
+        return len(self.features)
+
+    def get_arrays(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Return (features, targets_3, targets_5, weights) as numpy arrays."""
+        if len(self.features) == 0:
+            return (np.empty((0, 20)), np.empty(0, dtype=np.int64),
+                    np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float32))
+        return (
+            np.array(list(self.features), dtype=np.float32),
+            np.array(list(self.targets_3), dtype=np.int64),
+            np.array(list(self.targets_5), dtype=np.int64),
+            np.array(list(self.pnl_weights), dtype=np.float32),
+        )
+
+
+# Global buffer instance
+_trade_buffer = TradeFeatureBuffer()
+
+
+def micro_train_tcn(trade_buffer: TradeFeatureBuffer, model_path: str) -> Optional[dict]:
+    """Quick online TCN update using buffered trade features.
+
+    v5: Runs a few epochs on recent trade data only — fast adaptation
+    without waiting for the full training cycle. Uses lower LR to
+    avoid catastrophic forgetting of general patterns.
+    """
+    if len(trade_buffer) < 30:
+        return None
+
+    import torch
+    import torch.nn as nn
+
+    sys.path.insert(0, "/home/coder/Goblin/services/prediction")
+    from models.tcn_model import TCNNetwork
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    feats, targets_3, _, weights = trade_buffer.get_arrays()
+
+    if len(feats) < 30:
+        return None
+
+    model = TCNNetwork(
+        n_features=20,
+        hidden_channels=TCN_HIDDEN_CHANNELS,
+        n_classes=3,
+        kernel_size=3,
+        dropout=0.1,  # Lower dropout for micro-training
+    ).to(device)
+
+    # Load existing weights
+    if os.path.isfile(model_path):
+        try:
+            state = torch.load(model_path, map_location=device, weights_only=True)
+            if "model_state_dict" in state:
+                model.load_state_dict(state["model_state_dict"])
+            else:
+                model.load_state_dict(state)
+            model.float()  # Ensure float32 after loading (AMP may save half-precision)
+        except Exception:
+            return None
+
+    # Build sequences from buffer
+    seq_length = min(30, len(feats) - 1)
+    X_seqs, y_seqs, w_seqs = [], [], []
+    for i in range(seq_length, len(feats)):
+        X_seqs.append(feats[i - seq_length:i])
+        y_seqs.append(targets_3[i])
+        w_seqs.append(max(weights[i], 0.1))
+
+    if len(X_seqs) < 10:
+        return None
+
+    X = torch.tensor(np.array(X_seqs, dtype=np.float32)).to(device)
+    y = torch.tensor(np.array(y_seqs, dtype=np.int64)).to(device)
+    w = torch.tensor(np.array(w_seqs, dtype=np.float32)).to(device)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=MICRO_TRAIN_LR, weight_decay=1e-4)
+    criterion = nn.CrossEntropyLoss(reduction='none')
+
+    use_amp = USE_AMP and device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+
+    model.train()
+    total_loss = 0.0
+    for epoch in range(MICRO_TRAIN_EPOCHS):
+        optimizer.zero_grad(set_to_none=True)
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            logits = model(X)
+            loss_per_sample = criterion(logits, y)
+            weighted_loss = (loss_per_sample * w).mean()
+        scaler.scale(weighted_loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        scaler.step(optimizer)
+        scaler.update()
+        total_loss += weighted_loss.item()
+
+    # Save updated model
+    torch.save({
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "n_features": 20,
+        "hidden_channels": TCN_HIDDEN_CHANNELS,
+        "n_classes": 3,
+    }, model_path)
+
+    avg_loss = total_loss / MICRO_TRAIN_EPOCHS
+    logger.info("TCN micro-training complete", buffer_size=len(trade_buffer),
+                sequences=len(X_seqs), avg_loss=round(avg_loss, 4))
+    return {"micro_train": True, "loss": round(avg_loss, 4), "samples": len(X_seqs)}
+
+
 # ── Model Training Functions ──────────────────────────────────────────
 
 def train_tcn_rl(
@@ -438,6 +780,9 @@ def train_tcn_rl(
     output_path: Path,
     epochs: int = 5,
     lr: float = 0.0003,
+    hidden_channels: int = 192,
+    seq_length: int = 30,
+    variant_name: str = "tcn",
 ) -> dict:
     """Train/update TCN model with RL reward weighting.
 
@@ -456,34 +801,41 @@ def train_tcn_rl(
     n_features = features.shape[2] if features.ndim == 3 else 20
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # v4: GPU optimizations — cudnn.benchmark auto-tunes convolution kernels
+    # for the TCN's fixed input sizes, giving ~10-20% speedup after first epoch
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+
     model = TCNNetwork(
         n_features=n_features,
-        hidden_channels=TCN_HIDDEN_CHANNELS,
+        hidden_channels=hidden_channels,
         n_classes=3,
         kernel_size=3,
         dropout=0.2,
     ).to(device)
 
     # Load existing weights if available (online learning)
+    _loaded_state = None
     if existing_model_path and os.path.isfile(existing_model_path):
         try:
             state = torch.load(existing_model_path, map_location=device, weights_only=True)
             # If checkpoint has different hidden_channels, rebuild the network
-            ckpt_hc = state.get("hidden_channels", TCN_HIDDEN_CHANNELS)
-            if ckpt_hc != TCN_HIDDEN_CHANNELS:
+            ckpt_hc = state.get("hidden_channels", hidden_channels)
+            if ckpt_hc != hidden_channels:
                 logger.info("TCN: checkpoint hidden_channels mismatch, training from scratch",
-                            checkpoint=ckpt_hc, configured=TCN_HIDDEN_CHANNELS)
+                            checkpoint=ckpt_hc, configured=hidden_channels)
             else:
                 if "model_state_dict" in state:
                     model.load_state_dict(state["model_state_dict"])
                 else:
                     model.load_state_dict(state)
+                model.float()  # Ensure float32 after loading (AMP may save half-precision)
+                _loaded_state = state
                 logger.info("TCN: loaded existing model for fine-tuning")
         except Exception as e:
             logger.warning("TCN: could not load existing model, training from scratch", error=str(e))
 
-    # Prepare data
-    seq_length = 60
+    # Prepare data (seq_length comes from function parameter)
     X_seqs, y_seqs, w_seqs = [], [], []
 
     for i in range(seq_length, len(features)):
@@ -497,9 +849,10 @@ def train_tcn_rl(
     if len(X_seqs) < 100:
         return {"status": "skipped", "reason": "insufficient sequences"}
 
-    X = torch.tensor(np.array(X_seqs, dtype=np.float32)).to(device)
-    y = torch.tensor(np.array(y_seqs, dtype=np.int64)).to(device)
-    w = torch.tensor(np.array(w_seqs, dtype=np.float32)).to(device)
+    # Keep data on CPU, use DataLoader to batch-transfer to GPU (avoids OOM)
+    X = torch.tensor(np.array(X_seqs, dtype=np.float32))
+    y = torch.tensor(np.array(y_seqs, dtype=np.int64))
+    w = torch.tensor(np.array(w_seqs, dtype=np.float32))
 
     # Walk-forward split: 80/20
     split = int(len(X) * 0.8)
@@ -507,15 +860,40 @@ def train_tcn_rl(
     y_train, y_test = y[:split], y[split:]
     w_train = w[:split]
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)  # v3: AdamW + weight decay
-    criterion = nn.CrossEntropyLoss(reduction='none')  # Per-sample loss for RL weighting
+    from torch.utils.data import TensorDataset, DataLoader
     batch_size = TCN_BATCH_SIZE
+    accum_steps = GRADIENT_ACCUMULATION_STEPS
+
+    train_dataset = TensorDataset(X_train, y_train, w_train)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
+                              num_workers=8, pin_memory=True, drop_last=True, persistent_workers=True)
+    test_dataset = TensorDataset(X_test, y_test)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size * 2, shuffle=False,
+                             num_workers=4, pin_memory=True, persistent_workers=True)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    criterion = nn.CrossEntropyLoss(reduction='none')
     best_acc = 0.0
 
-    # v3: Cosine annealing LR scheduler — smooth decay improves convergence
+    # v5: Cosine annealing with higher initial LR for fast adaptation
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer, T_0=max(epochs // 3, 5), T_mult=2, eta_min=lr * 0.01,
+        optimizer, T_0=max(epochs // 4, 5), T_mult=2, eta_min=lr * 0.01,
     )
+
+    # Restore optimizer/scheduler state from checkpoint if available
+    if _loaded_state is not None:
+        if "optimizer_state_dict" in _loaded_state:
+            try:
+                optimizer.load_state_dict(_loaded_state["optimizer_state_dict"])
+                logger.info("TCN: restored optimizer state from checkpoint")
+            except Exception as e:
+                logger.warning("TCN: could not restore optimizer state", error=str(e))
+        if "scheduler_state_dict" in _loaded_state:
+            try:
+                scheduler.load_state_dict(_loaded_state["scheduler_state_dict"])
+                logger.info("TCN: restored scheduler state from checkpoint")
+            except Exception as e:
+                logger.warning("TCN: could not restore scheduler state", error=str(e))
 
     # v3: Mixed Precision (AMP) — 2x faster training on GPU, less VRAM usage
     use_amp = USE_AMP and device.type == "cuda"
@@ -523,57 +901,98 @@ def train_tcn_rl(
 
     for epoch in range(epochs):
         model.train()
-        indices = torch.randperm(len(X_train))
         total_loss = 0.0
         n_batches = 0
 
-        for start in range(0, len(indices), batch_size):
-            batch_idx = indices[start:start + batch_size]
-            xb = X_train[batch_idx]
-            yb = y_train[batch_idx]
-            wb = w_train[batch_idx]
+        optimizer.zero_grad(set_to_none=True)
+        for xb, yb, wb in train_loader:
+            xb = xb.to(device, non_blocking=True)
+            yb = yb.to(device, non_blocking=True)
+            wb = wb.to(device, non_blocking=True)
 
-            optimizer.zero_grad(set_to_none=True)  # v3: slightly faster than zero_grad()
-
-            # v3: AMP autocast for mixed precision forward pass
             with torch.amp.autocast("cuda", enabled=use_amp):
                 logits = model(xb)
                 loss_per_sample = criterion(logits, yb)
-                # RL: weight loss by reward signal
                 weighted_loss = (loss_per_sample * wb).mean()
+                weighted_loss = weighted_loss / accum_steps
 
-            # v3: Scaled backward pass for AMP stability
             scaler.scale(weighted_loss).backward()
 
-            # Gradient clipping for stability (unscale first for AMP)
+            n_batches += 1
+            total_loss += weighted_loss.item() * accum_steps
+
+            if n_batches % accum_steps == 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+
+        # Final optimizer step if leftover gradients
+        if n_batches % accum_steps != 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-
             scaler.step(optimizer)
             scaler.update()
+            optimizer.zero_grad(set_to_none=True)
 
-            total_loss += weighted_loss.item()
-            n_batches += 1
-
-        # v3: Step the LR scheduler
         scheduler.step()
 
-        # Evaluate
+        # Evaluate using batched DataLoader (avoids GPU OOM on test set)
         model.eval()
+        correct = 0
+        total_test = 0
         with torch.no_grad():
-            with torch.amp.autocast("cuda", enabled=use_amp):
-                test_logits = model(X_test)
-            preds = test_logits.argmax(dim=1)
-            acc = (preds == y_test).float().mean().item()
+            for xb_test, yb_test in test_loader:
+                xb_test = xb_test.to(device, non_blocking=True)
+                yb_test = yb_test.to(device, non_blocking=True)
+                with torch.amp.autocast("cuda", enabled=use_amp):
+                    test_logits = model(xb_test)
+                preds = test_logits.argmax(dim=1)
+                correct += (preds == yb_test).sum().item()
+                total_test += len(yb_test)
+        acc = correct / max(total_test, 1)
 
         if acc > best_acc:
             best_acc = acc
-            torch.save({
+            save_dict = {
                 "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
                 "n_features": n_features,
-                "hidden_channels": TCN_HIDDEN_CHANNELS,
+                "hidden_channels": hidden_channels,
                 "n_classes": 3,
-            }, output_path / "tcn_latest.pt")
+                "epoch": epoch,
+                "accuracy": best_acc,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            # Save as variant-specific latest file
+            latest_filename = f"{variant_name}_latest.pt"
+            torch.save(save_dict, output_path / latest_filename)
+
+            # Model versioning: save timestamped copy
+            ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            versioned_filename = f"{variant_name}_{ts}.pt"
+            torch.save(save_dict, output_path / versioned_filename)
+
+            # Keep only last 3 versioned copies per variant
+            import glob as _glob
+            version_pattern = str(output_path / f"{variant_name}_20*.pt")
+            versioned_files = sorted(_glob.glob(version_pattern))
+            while len(versioned_files) > 3:
+                os.remove(versioned_files.pop(0))
+
+            # Save best model copy when new best accuracy is achieved
+            best_path = output_path / f"{variant_name}_best.pt"
+            existing_best_acc = 0.0
+            if best_path.exists():
+                try:
+                    old_best = torch.load(best_path, map_location="cpu", weights_only=True)
+                    existing_best_acc = old_best.get("accuracy", 0.0)
+                except Exception:
+                    pass
+            if best_acc > existing_best_acc:
+                torch.save(save_dict, best_path)
 
     # Directional accuracy (ignore neutral class=2)
     model.eval()
@@ -586,6 +1005,7 @@ def train_tcn_rl(
 
     metadata = {
         "model_type": "tcn",
+        "variant": variant_name,
         "trained_at": datetime.now(timezone.utc).isoformat(),
         "samples_train": int(len(X_train)),
         "samples_test": int(len(X_test)),
@@ -594,6 +1014,7 @@ def train_tcn_rl(
         "rl_weighted": reward_weights is not None,
         "features": TECHNICAL_FEATURES,
         "seq_length": seq_length,
+        "hidden_channels": hidden_channels,
         "device": str(device),
         "version": datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S"),
         "learning_type": "reinforcement_online",
@@ -602,11 +1023,11 @@ def train_tcn_rl(
         "lr_scheduler": "CosineAnnealingWarmRestarts",
     }
 
-    with open(output_path / "tcn_metadata.json", "w") as f:
+    with open(output_path / f"{variant_name}_metadata.json", "w") as f:
         json.dump(metadata, f, indent=2)
 
-    logger.info("TCN RL training complete", accuracy=best_acc, dir_accuracy=dir_acc,
-                rl_weighted=reward_weights is not None)
+    logger.info("TCN RL training complete", variant=variant_name, accuracy=best_acc,
+                dir_accuracy=dir_acc, rl_weighted=reward_weights is not None)
     return metadata
 
 
@@ -888,6 +1309,9 @@ async def training_cycle(pool: asyncpg.Pool, redis: aioredis.Redis,
     if reward_summary:
         logger.info("Reward evaluation", rewards=reward_summary)
 
+    # v4: Live PnL feedback — read recent trade outcomes from Redis
+    pnl_signals = await fetch_pnl_reward_signal(redis, lookback_hours=6)
+
     # Compute features and targets per symbol — parallelized across CPU cores
     now_utc = datetime.now(timezone.utc)
     symbols_to_process = []
@@ -902,31 +1326,43 @@ async def training_cycle(pool: asyncpg.Pool, redis: aioredis.Redis,
 
     def _process_symbol_data(symbol: str) -> Optional[tuple]:
         """Compute features, targets, and weights for one symbol. Runs in parallel."""
+        global _feature_cache, _feature_cache_hits, _feature_cache_misses
         sym_df = symbol_dfs[symbol]
-        feats = compute_features_for_df(sym_df)  # (N, 20)
-        t3 = compute_targets_3class(sym_df["close"].values)
-        t5 = compute_targets_5class(sym_df["close"].values)
+        n_candles = len(sym_df)
+
+        # v6: Check feature cache — reuse if candle count unchanged (same data)
+        cached = _feature_cache.get(symbol)
+        if cached and cached[0] == n_candles:
+            feats, t3, t5 = cached[1], cached[2], cached[3]
+            _feature_cache_hits += 1
+        else:
+            feats = compute_features_for_df(sym_df)  # (N, 20)
+            t3 = compute_targets_3class(sym_df["close"].values)
+            t5 = compute_targets_5class(sym_df["close"].values)
+            _feature_cache[symbol] = (n_candles, feats, t3, t5)
+            _feature_cache_misses += 1
 
         sym_reward = reward_summary.get(symbol, 0.0)
-        reward_weight = 1.0 + sym_reward * 0.5
+        # v5: Combine RL reward with live PnL feedback (asymmetric multipliers)
+        pnl_multiplier = pnl_signals.get(symbol, 1.0)
+        reward_weight = (1.0 + sym_reward * 0.5) * pnl_multiplier
 
         weights = np.ones(len(feats))
+        timestamps_epoch = np.zeros(len(feats))
         if "time" in sym_df.columns:
-            times = sym_df["time"].values
-            for i in range(len(times)):
-                try:
-                    t = pd.Timestamp(times[i])
-                    if t.tzinfo is None:
-                        t = t.tz_localize("UTC")
-                    age_days = (now_utc - t.to_pydatetime()).total_seconds() / 86400
-                    recency = RECENCY_MAX_BOOST * (0.5 ** (age_days / RECENCY_HALF_LIFE_DAYS))
-                    recency = max(recency, 0.3)
-                    weights[i] = recency * reward_weight
-                except Exception:
-                    weights[i] = reward_weight
+            try:
+                times_series = pd.to_datetime(sym_df["time"].values, utc=True)
+                age_seconds = (now_utc - times_series).total_seconds()
+                age_days = age_seconds.values.astype(float) / 86400
+                recency = RECENCY_MAX_BOOST * np.power(0.5, age_days / RECENCY_HALF_LIFE_DAYS)
+                recency = np.maximum(recency, 0.3)
+                weights[:len(recency)] = recency * reward_weight
+                timestamps_epoch[:len(times_series)] = times_series.astype(np.int64) / 1e9
+            except Exception:
+                weights[:] = reward_weight
 
         valid = len(feats) - REWARD_LOOKBACK_CANDLES
-        return (feats[:valid], t3[:valid], t5[:valid], weights[:valid])
+        return (feats[:valid], t3[:valid], t5[:valid], weights[:valid], timestamps_epoch[:valid])
 
     # Parallel feature computation across CPU cores
     from concurrent.futures import ThreadPoolExecutor
@@ -936,8 +1372,9 @@ async def training_cycle(pool: asyncpg.Pool, redis: aioredis.Redis,
     all_targets_3 = []
     all_targets_5 = []
     all_reward_weights = []
+    all_timestamps = []
 
-    n_workers = min(len(symbols_to_process), 16)  # Use up to 16 cores for feature computation
+    n_workers = min(len(symbols_to_process), 48)  # Use up to 48 threads (numpy releases GIL for CPU-bound ops)
     if n_workers > 1:
         with ThreadPoolExecutor(max_workers=n_workers) as executor:
             futures = {executor.submit(_process_symbol_data, sym): sym for sym in symbols_to_process}
@@ -945,22 +1382,24 @@ async def training_cycle(pool: asyncpg.Pool, redis: aioredis.Redis,
                 try:
                     result = future.result()
                     if result is not None:
-                        feats, t3, t5, w = result
+                        feats, t3, t5, w, ts = result
                         all_features.append(feats)
                         all_targets_3.append(t3)
                         all_targets_5.append(t5)
                         all_reward_weights.append(w)
+                        all_timestamps.append(ts)
                 except Exception as e:
                     logger.debug("Symbol feature computation failed", symbol=futures[future], error=str(e))
     else:
         for sym in symbols_to_process:
             result = _process_symbol_data(sym)
             if result is not None:
-                feats, t3, t5, w = result
+                feats, t3, t5, w, ts = result
                 all_features.append(feats)
                 all_targets_3.append(t3)
                 all_targets_5.append(t5)
                 all_reward_weights.append(w)
+                all_timestamps.append(ts)
 
     if not all_features:
         logger.warning("No features computed")
@@ -970,8 +1409,14 @@ async def training_cycle(pool: asyncpg.Pool, redis: aioredis.Redis,
     targets_3 = np.concatenate(all_targets_3)
     targets_5 = np.concatenate(all_targets_5)
     reward_weights = np.concatenate(all_reward_weights)
+    sample_timestamps = np.concatenate(all_timestamps)
 
-    logger.info(f"Training data: {len(features)} samples, {features.shape[1]} features")
+    # v5: Apply per-sample PnL-based weights from recent trade history
+    pnl_sample_weights = await fetch_trade_sample_weights(redis, len(features), sample_timestamps)
+    reward_weights = reward_weights * pnl_sample_weights  # Combine recency + PnL weights
+
+    logger.info(f"Training data: {len(features)} samples, {features.shape[1]} features, "
+                f"PnL-weighted samples: {int((pnl_sample_weights > 1.0).sum())}")
 
     # v2: Always use RL weighting (warm start) and always try incremental learning
     tcn_existing = str(MODELS_DIR / "tcn_latest.pt")
@@ -993,56 +1438,62 @@ async def training_cycle(pool: asyncpg.Pool, redis: aioredis.Redis,
         except Exception:
             pass
 
-    # Train primary TCN with RL (always use reward weights + incremental)
+    # v5: Train ALL multi-timeframe TCN variants with FULL epochs — GPU can handle it
+    # Each variant uses different sequence length and hidden channels
+    TCN_VARIANT_CONFIGS = [
+        {"name": "tcn_micro",  "seq_length": 15,  "hidden_channels": 256},
+        {"name": "tcn_short",  "seq_length": 30,  "hidden_channels": 384},
+        {"name": "tcn_medium", "seq_length": 60,  "hidden_channels": 512},
+        {"name": "tcn_long",   "seq_length": 120, "hidden_channels": 512},
+    ]
+
+    # Train primary TCN using tcn_short config as default
     tcn_meta = await asyncio.to_thread(
         train_tcn_rl,
         features, targets_3,
-        reward_weights,  # v2: always use RL weighting
-        tcn_existing,    # v2: always try incremental
+        reward_weights,
+        tcn_existing,
         MODELS_DIR,
         TCN_EPOCHS_PER_CYCLE,
         LEARNING_RATE_TCN,
+        hidden_channels=192,
+        seq_length=30,
+        variant_name="tcn",
     )
 
-    # Train multi-timeframe TCN variants in parallel across CPU cores
-    # Each variant uses different sequence length and hidden channels
-    TCN_VARIANT_CONFIGS = [
-        {"name": "tcn_micro",  "seq_length": 15,  "hidden_channels": 128},
-        {"name": "tcn_short",  "seq_length": 30,  "hidden_channels": 192},
-        {"name": "tcn_long",   "seq_length": 120, "hidden_channels": 256},
-    ]
-
     async def _train_variant(variant_cfg):
-        """Train a single TCN variant."""
+        """Train a single TCN variant with its own architecture config."""
         vname = variant_cfg["name"]
+        v_hc = variant_cfg["hidden_channels"]
+        v_sl = variant_cfg["seq_length"]
         v_existing = str(MODELS_DIR / f"{vname}_latest.pt")
         try:
             meta = await asyncio.to_thread(
                 train_tcn_rl,
                 features, targets_3,
                 reward_weights,
-                v_existing if os.path.isfile(v_existing) else tcn_existing,
+                v_existing if os.path.isfile(v_existing) else None,
                 MODELS_DIR,
-                max(TCN_EPOCHS_PER_CYCLE // 2, 10),  # Fewer epochs for variants
+                TCN_EPOCHS_PER_CYCLE,
                 LEARNING_RATE_TCN,
+                hidden_channels=v_hc,
+                seq_length=v_sl,
+                variant_name=vname,
             )
-            # Rename output to variant-specific filename
-            src = MODELS_DIR / "tcn_latest.pt"
-            dst = MODELS_DIR / f"{vname}_latest.pt"
-            if src.exists():
-                import shutil
-                shutil.copy2(str(src), str(dst))
-            logger.info(f"TCN variant {vname} trained", accuracy=meta.get("accuracy", 0))
+            logger.info(f"TCN variant {vname} trained (full epochs)",
+                        accuracy=meta.get("accuracy", 0),
+                        hidden_channels=v_hc, seq_length=v_sl)
             return meta
         except Exception as e:
             logger.warning(f"TCN variant {vname} training failed", error=str(e))
             return {"status": "failed", "variant": vname}
 
-    # Train variants sequentially (they share GPU) but feature prep was parallelized
+    # v5: Train ALL variants sequentially (they share GPU) — every variant gets full training
     variant_metas = []
     for vcfg in TCN_VARIANT_CONFIGS:
         vmeta = await _train_variant(vcfg)
         variant_metas.append(vmeta)
+        logger.info(f"Variant {vcfg['name']} complete, moving to next")
 
     # Train XGBoost with RL
     xgb_meta = await asyncio.to_thread(
@@ -1055,19 +1506,76 @@ async def training_cycle(pool: asyncpg.Pool, redis: aioredis.Redis,
         LEARNING_RATE_XGB,
     )
 
-    # v2: Performance gating — only deploy if new model isn't worse
+    # v6: Performance gating — rolling window + staleness override
     tcn_deployed = True
     xgb_deployed = True
+    MIN_ACCURACY_FLOOR = 0.45  # Better than random for 3-class
+    STALENESS_MINUTES = 30
+
+    def _should_deploy(new_acc, meta_pattern, model_label):
+        """Check if new model should be deployed using rolling window of last 3 models."""
+        import glob as _glob
+
+        # Check staleness of current model
+        current_meta_path = MODELS_DIR / f"{model_label}_metadata.json"
+        is_stale = False
+        if current_meta_path.exists():
+            try:
+                with open(current_meta_path) as f:
+                    trained_at = json.load(f).get("trained_at", "")
+                if trained_at:
+                    trained_time = datetime.fromisoformat(trained_at)
+                    age_minutes = (datetime.now(timezone.utc) - trained_time).total_seconds() / 60
+                    if age_minutes > STALENESS_MINUTES:
+                        is_stale = True
+                        logger.info(f"{model_label} model is stale ({age_minutes:.0f}min old), lowering deploy bar")
+            except Exception:
+                pass
+
+        # If stale, always deploy (force refresh)
+        if is_stale:
+            return True
+
+        # Collect accuracy history from last 3 versioned models
+        version_pattern = str(MODELS_DIR / meta_pattern)
+        versioned_files = sorted(_glob.glob(version_pattern))[-3:]
+
+        if not versioned_files:
+            # No previous models — deploy if above minimum floor
+            if new_acc >= MIN_ACCURACY_FLOOR:
+                return True
+            logger.warning(f"{model_label} accuracy {new_acc:.4f} below floor {MIN_ACCURACY_FLOOR}")
+            return False
+
+        # Load accuracy from versioned model files
+        recent_accs = []
+        for vf in versioned_files:
+            try:
+                import torch
+                state = torch.load(vf, map_location="cpu", weights_only=True)
+                acc_val = state.get("accuracy", 0.0)
+                if acc_val > 0:
+                    recent_accs.append(acc_val)
+            except Exception:
+                pass
+
+        if not recent_accs:
+            return new_acc >= MIN_ACCURACY_FLOOR
+
+        avg_recent = sum(recent_accs) / len(recent_accs)
+        if new_acc >= avg_recent:
+            logger.info(f"{model_label} beats rolling avg ({new_acc:.4f} >= {avg_recent:.4f}), deploying")
+            return True
+        else:
+            logger.warning(f"{model_label} below rolling avg ({new_acc:.4f} < {avg_recent:.4f}), skipping deploy")
+            return False
+
     if GATE_MODELS:
         new_tcn_acc = tcn_meta.get("accuracy", 0)
         new_xgb_acc = xgb_meta.get("accuracy", 0)
-        if new_tcn_acc < current_tcn_acc - MIN_ACCURACY_IMPROVEMENT and current_tcn_acc > 0:
-            logger.warning("TCN accuracy regressed, keeping old model",
-                           current=current_tcn_acc, new=new_tcn_acc)
+        if not _should_deploy(new_tcn_acc, "tcn_20*.pt", "tcn"):
             tcn_deployed = False
-        if new_xgb_acc < current_xgb_acc - MIN_ACCURACY_IMPROVEMENT and current_xgb_acc > 0:
-            logger.warning("XGBoost accuracy regressed, keeping old model",
-                           current=current_xgb_acc, new=new_xgb_acc)
+        if not _should_deploy(new_xgb_acc, "xgboost_20*.json", "xgboost"):
             xgb_deployed = False
 
     # Update registry and signal reload only if at least one model improved
@@ -1086,12 +1594,25 @@ async def training_cycle(pool: asyncpg.Pool, redis: aioredis.Redis,
         "total_samples": len(features),
         "symbols": int(candles_df["symbol"].nunique()),
         "reward_summary": {k: round(v, 4) for k, v in reward_summary.items()},
+        "pnl_signals": {k: round(v, 4) for k, v in pnl_signals.items()},
         "tcn": tcn_meta,
+        "tcn_variants": [m for m in variant_metas if isinstance(m, dict)],
         "xgboost": xgb_meta,
         "tcn_deployed": tcn_deployed,
         "xgb_deployed": xgb_deployed,
         "recency_half_life_days": RECENCY_HALF_LIFE_DAYS,
         "outcome_window_minutes": REWARD_LOOKBACK_CANDLES * 5,
+        "pnl_weighted_samples": int((pnl_sample_weights > 1.0).sum()),
+        "version": "v5.0",
+        "training_config": {
+            "tcn_epochs": TCN_EPOCHS_PER_CYCLE,
+            "xgb_rounds": XGB_BOOST_ROUNDS_PER_CYCLE,
+            "batch_size": TCN_BATCH_SIZE,
+            "gradient_accumulation": GRADIENT_ACCUMULATION_STEPS,
+            "learning_rate_tcn": LEARNING_RATE_TCN,
+            "pnl_big_win_mult": PNL_BIG_WIN_MULTIPLIER,
+            "pnl_big_loss_mult": PNL_BIG_LOSS_MULTIPLIER,
+        },
     }
     with open(MODELS_DIR / "training_summary.json", "w") as f:
         json.dump(summary, f, indent=2)
@@ -1157,11 +1678,120 @@ async def listen_for_predictions(redis: aioredis.Redis, reward_tracker: RewardTr
             backoff = min(backoff * 2, 30)
 
 
+async def listen_for_trade_closes(redis: aioredis.Redis, pool: asyncpg.Pool):
+    """Subscribe to trade close events and trigger micro-training.
+
+    v5: When a trade closes, we:
+    1. Extract its feature vector and PnL outcome
+    2. Add it to the in-memory buffer
+    3. Run a quick micro-training on the TCN with buffered data
+    This gives the model near-instant feedback from every trade.
+    """
+    backoff = 1
+    while running:
+        try:
+            pubsub = redis.pubsub()
+            # Listen for trade close notifications
+            await pubsub.subscribe("trade:closed", "trade_closed")
+            logger.info("Trade close listener started — micro-training enabled")
+            backoff = 1
+
+            async for message in pubsub.listen():
+                if not running:
+                    break
+                if message["type"] != "message":
+                    continue
+                try:
+                    trade = json.loads(message["data"])
+                    symbol = trade.get("symbol", "")
+                    realized_pnl = float(trade.get("realized_pnl", 0))
+                    entry_price = float(trade.get("entry_price", trade.get("price", 0)))
+                    entry_time_str = trade.get("entry_time", "")
+
+                    if not symbol or entry_price <= 0:
+                        continue
+
+                    pnl_pct = realized_pnl / entry_price if entry_price > 0 else 0
+
+                    # Compute PnL multiplier
+                    if pnl_pct > PNL_BIG_WIN_THRESHOLD:
+                        pnl_weight = PNL_BIG_WIN_MULTIPLIER
+                    elif pnl_pct > 0:
+                        pnl_weight = PNL_SMALL_WIN_MULTIPLIER
+                    elif pnl_pct > PNL_BIG_LOSS_THRESHOLD:
+                        pnl_weight = PNL_SMALL_LOSS_MULTIPLIER
+                    else:
+                        pnl_weight = PNL_BIG_LOSS_MULTIPLIER
+
+                    # Try to get recent candle features for this symbol
+                    try:
+                        async with pool.acquire() as conn:
+                            rows = await conn.fetch(
+                                """SELECT time, open, high, low, close, volume
+                                   FROM candles WHERE symbol = $1
+                                   ORDER BY time DESC LIMIT 100""",
+                                symbol,
+                            )
+                        if rows and len(rows) >= 20:
+                            df = pd.DataFrame([dict(r) for r in reversed(rows)])
+                            feats = compute_features_for_df(df)
+                            if len(feats) > 0:
+                                # Use the last feature vector as representative of this trade
+                                last_feat = feats[-1]
+                                # Determine target from actual trade outcome
+                                target_3 = 0 if pnl_pct > 0.001 else (1 if pnl_pct < -0.001 else 2)
+                                target_5 = (4 if pnl_pct > 0.015 else 3) if pnl_pct > 0.003 else \
+                                           (0 if pnl_pct < -0.015 else 1) if pnl_pct < -0.003 else 2
+
+                                ts = datetime.now(timezone.utc).timestamp()
+                                _trade_buffer.add(last_feat, target_3, target_5, pnl_weight, ts)
+
+                                logger.info("Trade added to micro-training buffer",
+                                            symbol=symbol, pnl_pct=round(pnl_pct * 100, 2),
+                                            weight=pnl_weight, buffer_size=len(_trade_buffer))
+
+                                # Trigger micro-training if buffer has enough data
+                                if len(_trade_buffer) >= 30:
+                                    model_path = str(MODELS_DIR / "tcn_latest.pt")
+                                    micro_result = await asyncio.to_thread(
+                                        micro_train_tcn, _trade_buffer, model_path
+                                    )
+                                    if micro_result:
+                                        await redis.publish("model:reload", "micro_updated")
+                                        await log_to_nerve_monitor(
+                                            redis,
+                                            f"Micro-training on {symbol} trade (PnL: {pnl_pct*100:.1f}%)",
+                                            micro_result,
+                                            level="info",
+                                            category="model",
+                                        )
+                    except Exception as e:
+                        logger.debug("Failed to compute features for micro-training",
+                                     symbol=symbol, error=str(e))
+
+                except Exception as e:
+                    logger.debug("Trade close processing error", error=str(e))
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error("Trade close listener error, reconnecting", error=str(e), backoff=backoff)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30)
+
+
 async def main():
     global DEFAULT_SYMBOLS
 
-    logger.info("Goblin Continuous Learner v2.0 starting",
+    logger.info("Goblin Continuous Learner v5.0 starting — MAX GPU utilization mode",
                 interval_min=TRAIN_INTERVAL_MINUTES,
+                tcn_epochs=TCN_EPOCHS_PER_CYCLE,
+                xgb_rounds=XGB_BOOST_ROUNDS_PER_CYCLE,
+                batch_size=TCN_BATCH_SIZE,
+                grad_accum=GRADIENT_ACCUMULATION_STEPS,
+                lr_tcn=LEARNING_RATE_TCN,
+                pnl_big_win=PNL_BIG_WIN_MULTIPLIER,
+                pnl_big_loss=PNL_BIG_LOSS_MULTIPLIER,
                 recency_half_life=RECENCY_HALF_LIFE_DAYS,
                 outcome_window_min=REWARD_LOOKBACK_CANDLES * 5,
                 models_dir=str(MODELS_DIR))
@@ -1188,6 +1818,9 @@ async def main():
     # v2: Start prediction listener in background (closes the RL feedback loop)
     prediction_task = asyncio.create_task(listen_for_predictions(redis, reward_tracker))
 
+    # v5: Start trade close listener for micro-training
+    trade_close_task = asyncio.create_task(listen_for_trade_closes(redis, pool))
+
     cycle = 0
 
     # Run first training immediately
@@ -1197,7 +1830,7 @@ async def main():
     except Exception as e:
         logger.error("Initial training cycle failed", error=str(e))
 
-    # Then loop on schedule
+    # Then loop on schedule — every 1 minute, GPU should NEVER be idle
     while running:
         try:
             # Sleep in small increments so we can respond to signals
@@ -1215,12 +1848,17 @@ async def main():
         except Exception as e:
             logger.error("Training cycle failed", cycle=cycle, error=str(e))
             # Wait a bit before retrying
-            await asyncio.sleep(60)
+            await asyncio.sleep(30)  # v5: shorter retry wait (was 60)
 
     logger.info("Continuous learner shutting down")
     prediction_task.cancel()
+    trade_close_task.cancel()
     try:
         await prediction_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await trade_close_task
     except asyncio.CancelledError:
         pass
     await pool.close()

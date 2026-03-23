@@ -44,7 +44,7 @@ PAPER_PORTFOLIO_VALUE = Gauge("executor_paper_portfolio_value", "Paper portfolio
 class OrderRequest(BaseModel):
     signal_id: str = ""
     symbol: str
-    side: str = Field(..., pattern="^(buy|sell)$")
+    side: str = Field(..., pattern="^(buy|sell|short_entry|short_exit)$")
     amount: float = Field(..., gt=0)
     price: Optional[float] = None
     order_type: str = "limit"
@@ -121,6 +121,13 @@ async def execute_paper_order(request: OrderRequest) -> OrderResponse:
             # Use position_size_usd if provided by portfolio-optimizer, else use amount
             cost = request.position_size_usd or request.amount
             order = await paper_executor.create_market_buy(request.symbol, cost)
+        elif request.side == "short_entry":
+            # Virtual short: reserve margin in USDT, track virtual short position
+            cost = request.position_size_usd or request.amount
+            order = await paper_executor.create_virtual_short_entry(request.symbol, cost)
+        elif request.side == "short_exit":
+            # Close virtual short: return margin + PnL
+            order = await paper_executor.create_virtual_short_exit(request.symbol, request.amount)
         else:
             order = await paper_executor.create_market_sell(request.symbol, request.amount)
 
@@ -174,9 +181,27 @@ async def execute_paper_order(request: OrderRequest) -> OrderResponse:
 
 
 async def execute_live_order(request: OrderRequest) -> OrderResponse:
-    """Execute order on MEXC exchange."""
+    """Execute order on MEXC exchange.
+
+    NOTE: MEXC spot does NOT support short selling. Short positions require
+    MEXC Futures API (ccxt defaultType='swap' or 'future'). Short entry/exit
+    signals are rejected in live spot mode. To enable live shorts, configure
+    a separate futures exchange connection with margin trading enabled.
+    """
     order_id = str(uuid.uuid4())[:8]
     start_time = datetime.utcnow()
+
+    # MEXC spot cannot handle short selling - reject with clear message
+    if request.side in ("short_entry", "short_exit"):
+        logger.warning("Short order rejected: MEXC spot does not support shorting. "
+                        "Requires MEXC Futures API (defaultType='swap').",
+                        order_id=order_id, symbol=request.symbol, side=request.side)
+        ORDERS_FAILED.labels(reason="spot_no_shorting").inc()
+        raise HTTPException(
+            status_code=400,
+            detail="Short selling not supported on MEXC spot. "
+                   "Requires futures/margin API (defaultType='swap')."
+        )
 
     logger.info("Executing live order", order_id=order_id, symbol=request.symbol,
                 side=request.side, amount=request.amount, price=request.price)

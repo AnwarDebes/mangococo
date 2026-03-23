@@ -27,6 +27,8 @@ class PaperExecutor(ExchangeExecutor):
         self._starting_capital = starting_capital
         self._balances: Dict[str, Dict] = {}
         self._orders: list = []
+        # Virtual short positions: {symbol: {"amount": float, "entry_price": float, "margin_held": float}}
+        self._virtual_shorts: Dict[str, Dict] = {}
 
     async def connect(self) -> None:
         # Load paper portfolio from Redis or initialize
@@ -34,7 +36,9 @@ class PaperExecutor(ExchangeExecutor):
         if saved:
             data = json.loads(saved)
             self._balances = data.get("balances", {})
-            logger.info("Paper executor loaded saved portfolio", balances=self._balances)
+            self._virtual_shorts = data.get("virtual_shorts", {})
+            logger.info("Paper executor loaded saved portfolio", balances=self._balances,
+                        virtual_shorts=len(self._virtual_shorts))
         else:
             self._balances = {
                 "USDT": {"free": self._starting_capital, "used": 0.0, "total": self._starting_capital}
@@ -59,8 +63,8 @@ class PaperExecutor(ExchangeExecutor):
         slippage = random.uniform(0.0001, 0.0005)
         fill_price = price * (1 + slippage)
 
-        # Simulate fee (0.1% taker fee on MEXC)
-        fee_rate = 0.001
+        # Simulate fee (0.05% taker fee on MEXC spot)
+        fee_rate = 0.0005  # MEXC actual taker fee: 0.05%
         fee = cost * fee_rate
         effective_cost = cost - fee
         amount = effective_cost / fill_price
@@ -121,7 +125,7 @@ class PaperExecutor(ExchangeExecutor):
 
         # Calculate proceeds
         gross_proceeds = amount * fill_price
-        fee_rate = 0.001
+        fee_rate = 0.0005  # MEXC actual taker fee: 0.05%
         fee = gross_proceeds * fee_rate
         net_proceeds = gross_proceeds - fee
 
@@ -161,6 +165,132 @@ class PaperExecutor(ExchangeExecutor):
         )
         return order
 
+    async def create_virtual_short_entry(self, symbol: str, cost: float) -> Dict:
+        """Open a virtual short position. Holds margin in USDT, tracks entry price.
+
+        Virtual shorts simulate margin shorting on spot:
+        - Reserve 'cost' USDT as margin collateral
+        - Record the entry price and virtual amount
+        - PnL = (entry_price - exit_price) * amount (realized on close)
+
+        MEXC spot does NOT support native short selling. This is a paper-only
+        simulation for strategy validation. For live short trading, MEXC Futures
+        API (ccxt defaultType='swap') would be required.
+        """
+        price = await self.fetch_ticker_price(symbol)
+        if price <= 0:
+            raise ValueError(f"Cannot get price for {symbol}")
+
+        # Simulate slippage
+        slippage = random.uniform(0.0001, 0.0005)
+        fill_price = price * (1 - slippage)  # Short sells at slightly lower price
+
+        # Simulate fee
+        fee_rate = 0.0005  # MEXC actual taker fee: 0.05%
+        fee = cost * fee_rate
+        effective_cost = cost - fee
+        amount = effective_cost / fill_price
+
+        # Check USDT balance for margin
+        usdt_bal = self._balances.get("USDT", {"free": 0})
+        if usdt_bal["free"] < cost:
+            raise ValueError(f"Insufficient USDT for short margin: {usdt_bal['free']:.4f} < {cost:.4f}")
+
+        # Reserve USDT as margin collateral
+        self._balances["USDT"]["free"] -= cost
+        self._balances["USDT"]["used"] += cost  # Margin is "used" not "free"
+
+        # Track virtual short position
+        self._virtual_shorts[symbol] = {
+            "amount": amount,
+            "entry_price": fill_price,
+            "margin_held": cost,
+        }
+
+        order = {
+            "id": f"paper_short_{uuid.uuid4().hex[:12]}",
+            "symbol": symbol,
+            "side": "short_entry",
+            "amount": amount,
+            "price": fill_price,
+            "cost": cost,
+            "filled": amount,
+            "status": "closed",
+            "fee": fee,
+        }
+        self._orders.append(order)
+        await self._save_portfolio()
+
+        logger.info(
+            "Paper SHORT ENTRY executed",
+            symbol=symbol,
+            amount=f"{amount:.8f}",
+            price=f"{fill_price:.8f}",
+            margin=f"{cost:.4f}",
+            fee=f"{fee:.6f}",
+        )
+        return order
+
+    async def create_virtual_short_exit(self, symbol: str, amount: float) -> Dict:
+        """Close a virtual short position. Returns margin + PnL to USDT balance.
+
+        PnL = (entry_price - exit_price) * amount
+        """
+        price = await self.fetch_ticker_price(symbol)
+        if price <= 0:
+            raise ValueError(f"Cannot get price for {symbol}")
+
+        if symbol not in self._virtual_shorts:
+            raise ValueError(f"No virtual short position for {symbol}")
+
+        short_pos = self._virtual_shorts[symbol]
+
+        # Simulate slippage (adverse for short exit = price goes up slightly)
+        slippage = random.uniform(0.0001, 0.0005)
+        fill_price = price * (1 + slippage)
+
+        # Simulate fee
+        fee_rate = 0.0005  # MEXC actual taker fee: 0.05%
+        close_cost = amount * fill_price
+        fee = close_cost * fee_rate
+
+        # Calculate PnL: shorts profit when price goes down
+        pnl = (short_pos["entry_price"] - fill_price) * amount - fee
+
+        # Return margin + PnL to available balance
+        margin_returned = short_pos["margin_held"]
+        self._balances["USDT"]["free"] += margin_returned + pnl
+        self._balances["USDT"]["used"] -= margin_returned
+        self._balances["USDT"]["total"] += pnl  # total changes by PnL only
+
+        # Clean up virtual short
+        del self._virtual_shorts[symbol]
+
+        order = {
+            "id": f"paper_short_exit_{uuid.uuid4().hex[:12]}",
+            "symbol": symbol,
+            "side": "short_exit",
+            "amount": amount,
+            "price": fill_price,
+            "cost": close_cost,
+            "filled": amount,
+            "status": "closed",
+            "fee": fee,
+            "pnl": pnl,
+        }
+        self._orders.append(order)
+        await self._save_portfolio()
+
+        logger.info(
+            "Paper SHORT EXIT executed",
+            symbol=symbol,
+            amount=f"{amount:.8f}",
+            price=f"{fill_price:.8f}",
+            pnl=f"{pnl:.4f}",
+            fee=f"{fee:.6f}",
+        )
+        return order
+
     async def fetch_ticker_price(self, symbol: str) -> float:
         """Get real market price from Redis (latest_ticks from market-data service)."""
         tick_data = await self._redis.hget("latest_ticks", symbol)
@@ -177,6 +307,7 @@ class PaperExecutor(ExchangeExecutor):
         """Persist paper portfolio to Redis."""
         data = {
             "balances": self._balances,
+            "virtual_shorts": self._virtual_shorts,
             "updated_at": datetime.utcnow().isoformat(),
             "total_orders": len(self._orders),
         }
@@ -198,12 +329,29 @@ class PaperExecutor(ExchangeExecutor):
                 "amount": bal["total"],
                 "price": price,
                 "value": value,
+                "side": "long",
+            }
+
+        # Include virtual short positions and their unrealized PnL
+        for symbol, short_pos in self._virtual_shorts.items():
+            price = await self.fetch_ticker_price(symbol)
+            unrealized_pnl = (short_pos["entry_price"] - price) * short_pos["amount"]
+            # Virtual short value = margin held + unrealized PnL
+            total_value += unrealized_pnl  # PnL adjusts total (margin is already in USDT used)
+            positions[f"{symbol}_SHORT"] = {
+                "amount": short_pos["amount"],
+                "entry_price": short_pos["entry_price"],
+                "price": price,
+                "value": short_pos["margin_held"] + unrealized_pnl,
+                "unrealized_pnl": unrealized_pnl,
+                "side": "short",
             }
 
         return {
             "total_value": total_value,
             "usdt_balance": self._balances.get("USDT", {}).get("total", 0),
             "positions": positions,
+            "virtual_shorts": len(self._virtual_shorts),
             "total_orders": len(self._orders),
             "pnl": total_value - self._starting_capital,
             "pnl_pct": ((total_value / self._starting_capital) - 1) * 100 if self._starting_capital > 0 else 0,

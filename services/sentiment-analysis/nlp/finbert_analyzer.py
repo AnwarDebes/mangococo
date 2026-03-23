@@ -42,12 +42,34 @@ class FinBERTAnalyzer:
             self._tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
             self._model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME)
 
-            # Force CPU — FinBERT runs infrequently (every 10-15 min) and
-            # frees ~2 GB GPU VRAM for the multi-TCN ensemble in prediction service.
-            # CPU inference adds ~200ms per batch of 32 — negligible for this cycle.
-            self._device = "cpu"
-            self._model = self._model.to("cpu")
-            logger.info("finbert_loaded", device="cpu", reason="GPU VRAM reserved for TCN ensemble")
+            # V100 32GB has plenty of VRAM for both FinBERT (~1.5GB) and
+            # the TCN ensemble (~4-6GB). Use GPU for faster inference.
+            if torch.cuda.is_available():
+                try:
+                    self._device = "cuda"
+                    self._model = self._model.to("cuda")
+                    # Smoke test: run a dummy forward pass to catch OOM early
+                    _dummy = self._tokenizer("test", return_tensors="pt")
+                    _dummy = {k: v.to("cuda") for k, v in _dummy.items()}
+                    with torch.no_grad():
+                        self._model(**_dummy)
+                    del _dummy
+                    torch.cuda.empty_cache()
+                    logger.info("finbert_loaded", device="cuda")
+                except torch.cuda.OutOfMemoryError:
+                    logger.warning("finbert_cuda_oom", fallback="cpu",
+                                   reason="CUDA OOM during FinBERT load, falling back to CPU")
+                    torch.cuda.empty_cache()
+                    self._device = "cpu"
+                    self._model = self._model.to("cpu")
+                except Exception as gpu_err:
+                    logger.warning("finbert_cuda_error", fallback="cpu", error=str(gpu_err))
+                    self._device = "cpu"
+                    self._model = self._model.to("cpu")
+            else:
+                self._device = "cpu"
+                self._model = self._model.to("cpu")
+                logger.info("finbert_loaded", device="cpu", reason="CUDA not available")
 
             self._model.eval()
         except Exception as e:
