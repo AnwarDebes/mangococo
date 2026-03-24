@@ -25,7 +25,7 @@ MIN_POSITION_USD = float(os.getenv("MIN_POSITION_USD", 5.0))
 MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", 0.10))
 # MAX_OPEN_POSITIONS removed — the system dynamically limits positions based on
 # available capital, MIN_POSITION_USD, and confidence.  No artificial cap.
-MIN_TIME_BETWEEN_TRADES = int(os.getenv("MIN_TIME_BETWEEN_TRADES", 300))  # v13: raised from 180s to 300s
+MIN_TIME_BETWEEN_TRADES = int(os.getenv("MIN_TIME_BETWEEN_TRADES", 120))  # 2min: balances trade frequency with diversity across 500+ symbols
 # Legacy exit parameters — NO LONGER USED by position manager (AI controls exits).
 # Kept here only so the risk_parameters Redis key doesn't break other services that read it.
 PROFIT_TARGET_PCT = float(os.getenv("PROFIT_TARGET_PCT", 0.001))

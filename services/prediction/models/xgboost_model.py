@@ -17,6 +17,34 @@ logger = structlog.get_logger()
 CLASS_LABELS: List[str] = ["strong_sell", "sell", "hold", "buy", "strong_buy"]
 CLASS_TO_IDX: Dict[str, int] = {label: idx for idx, label in enumerate(CLASS_LABELS)}
 
+# Temperature scaling for XGBoost: spreads probability distribution to reduce
+# "always hold" collapse. Applied as power-scaling: probs^(1/T) then renormalize.
+INFERENCE_TEMPERATURE = 2.0
+
+# Hold penalty: reduce hold probability to force directional predictions.
+# XGBoost outputs probabilities directly (multi:softprob), so we scale hold down.
+HOLD_PENALTY_FACTOR = 0.03  # Multiply hold probability by this before renormalizing
+
+
+def _apply_temperature(probs: np.ndarray, temperature: float = INFERENCE_TEMPERATURE) -> np.ndarray:
+    """Apply temperature scaling + hold penalty to probability array."""
+    # Apply hold penalty (class index 2 = "hold")
+    if probs.ndim == 1:
+        probs = probs.copy()
+        probs[2] *= HOLD_PENALTY_FACTOR
+        probs = probs / probs.sum()
+    else:
+        probs = probs.copy()
+        probs[:, 2] *= HOLD_PENALTY_FACTOR
+        probs = probs / probs.sum(axis=1, keepdims=True)
+
+    if temperature == 1.0:
+        return probs
+    scaled = np.power(probs.clip(1e-10), 1.0 / temperature)
+    if scaled.ndim == 1:
+        return scaled / scaled.sum()
+    return scaled / scaled.sum(axis=1, keepdims=True)
+
 
 class XGBoostModel:
     """Wrapper around an XGBoost multi-class classifier for trading signal prediction."""
@@ -89,6 +117,7 @@ class XGBoostModel:
         else:
             probs = raw_probs[0]
 
+        probs = _apply_temperature(probs)
         predicted_idx = int(np.argmax(probs))
         direction = CLASS_LABELS[predicted_idx]
         confidence = float(probs[predicted_idx])
@@ -124,6 +153,7 @@ class XGBoostModel:
         if all_probs.ndim == 1:
             all_probs = all_probs.reshape(1, -1)
 
+        all_probs = _apply_temperature(all_probs)
         results = []
         for probs in all_probs:
             idx = int(np.argmax(probs))

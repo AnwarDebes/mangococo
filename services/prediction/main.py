@@ -51,7 +51,7 @@ FEATURE_STORE_URL = os.getenv("FEATURE_STORE_URL", "http://localhost:8007")
 INFERENCE_INTERVAL = float(os.getenv("INFERENCE_INTERVAL", 2.0))
 TRADING_PAIRS_FILE = os.getenv("TRADING_PAIRS_FILE", "")
 TRADING_PAIRS = os.getenv("TRADING_PAIRS", "BTC/USDT,ETH/USDT,SOL/USDT").split(",")
-MAX_ACTIVE_PAIRS = int(os.getenv("MAX_ACTIVE_PAIRS", 50))
+MAX_ACTIVE_PAIRS = int(os.getenv("MAX_ACTIVE_PAIRS", 500))
 
 logger = structlog.get_logger()
 

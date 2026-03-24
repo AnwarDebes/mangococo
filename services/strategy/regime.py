@@ -193,12 +193,11 @@ def regime_allows_entry(regime: RegimeState, direction: str) -> bool:
     In choppy regime: only allow if choppiness < 0.8 (marginal chop OK
     with strong edge gate).
     In high_vol: allow (gate will reduce size), but flag it.
-    In trending: allow if direction aligns.
+    In trending: allow — the ML models already see trend features (EMA crosses,
+    momentum) and factor them into their predictions. Blocking counter-trend
+    entries here was preventing ALL trades because most symbols were in
+    trending_down during the current fear cycle.
     """
     if regime.regime == "choppy" and regime.choppiness > 0.8:
         return False
-    if regime.regime == "trending_down" and direction == "buy":
-        return False  # don't go long in a downtrend
-    if regime.regime == "trending_up" and direction == "sell":
-        return False  # don't short in an uptrend
     return True

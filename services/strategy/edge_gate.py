@@ -41,8 +41,8 @@ class EdgeDecision:
 
 # ── Configuration ─────────────────────────────────────────────────────
 
-EDGE_THRESHOLD = 0.58          # v13: raised from 0.50 — only take trades with real edge
-MIN_CONFIDENCE = 0.55          # v13: raised from 0.50 — marginal signals were net-negative
+EDGE_THRESHOLD = 0.30          # Lowered: ensemble averaging dilutes scores; edge gate adds its own quality factors
+MIN_CONFIDENCE = 0.10          # Low: ensemble confidence is naturally diluted; quality comes from edge composite
 AGREEMENT_BONUS = 0.15         # bonus when TCN + XGBoost agree
 
 # Spread filter: tightened for normal entries, relaxed for fast movers
@@ -93,11 +93,11 @@ FEAR_GREED_EDGE_BONUS = {
 
 # F&G-aware minimum confidence thresholds (overrides MIN_CONFIDENCE per zone)
 FEAR_GREED_MIN_CONFIDENCE = {
-    "extreme_fear":  0.55,   # Relaxed from 0.70 to allow more entries in extreme fear
-    "fear":          0.52,   # Relaxed from 0.60 to allow more entries in fear
-    "neutral":       0.50,   # Normal operation
-    "greed":         0.52,   # Relaxed from 0.60 to allow more entries in greed
-    "extreme_greed": 0.55,   # Relaxed from 0.70 to allow more entries in extreme greed
+    "extreme_fear":  0.10,   # Ensemble-averaged confidence is low; edge composite provides quality filter
+    "fear":          0.10,
+    "neutral":       0.10,
+    "greed":         0.12,
+    "extreme_greed": 0.15,
 }
 
 # v13: Reduced max concurrent positions — too many correlated altcoin positions

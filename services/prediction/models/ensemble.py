@@ -38,14 +38,18 @@ SCORE_TO_CLASS = [
 
 
 def _score_to_direction(score: float) -> str:
-    """Map a continuous score to a discrete 5-class label."""
-    if score <= -0.7:
+    """Map a continuous score to a discrete 5-class label.
+
+    Narrow hold zone: temperature-scaled models produce lower scores,
+    so the hold dead-zone must be tight to avoid suppressing all signals.
+    """
+    if score <= -0.5:
         return "strong_sell"
-    if score <= -0.2:
+    if score <= -0.05:
         return "sell"
-    if score <= 0.2:
+    if score <= 0.05:
         return "hold"
-    if score <= 0.7:
+    if score <= 0.5:
         return "buy"
     return "strong_buy"
 
@@ -92,7 +96,7 @@ class EnsembleCombiner:
     WEIGHT_XGB = 0.40
     WEIGHT_SENTIMENT = 0.15
     WEIGHT_ONCHAIN = 0.10
-    AGREEMENT_BONUS = 0.15
+    AGREEMENT_BONUS = 0.25
 
     # Per-variant weights within the TCN allocation (sum to 1.0)
     TCN_VARIANT_WEIGHTS = {
@@ -220,7 +224,19 @@ class EnsembleCombiner:
         breakdown["agreement_bonus"] = self.AGREEMENT_BONUS if agreement else 0.0
 
         direction = _score_to_direction(final_score)
-        confidence = min(1.0, abs(final_score))
+
+        # Confidence: use the stronger of abs(score) or max individual model
+        # confidence (when directional). Ensemble averaging dilutes confidence,
+        # but if a model is confident and directional, that should carry through.
+        score_confidence = min(1.0, abs(final_score))
+        model_confidences = []
+        if tcn_pred and _direction_sign(tcn_pred.direction) != 0:
+            model_confidences.append(tcn_pred.confidence)
+        if xgb_pred and _direction_sign(xgb_pred.direction) != 0:
+            model_confidences.append(xgb_pred.confidence)
+        max_model_conf = max(model_confidences) if model_confidences else 0.0
+        # Blend: 60% score-based, 40% best-model-based (prevents pure score dilution)
+        confidence = 0.6 * score_confidence + 0.4 * max_model_conf
 
         return EnsemblePrediction(
             direction=direction,

@@ -147,6 +147,15 @@ class TCNNetwork(nn.Module):
 
 DIRECTION_MAP = {0: "up", 1: "down", 2: "neutral"}
 
+# Temperature scaling: spreads probabilities to make model less conservative.
+INFERENCE_TEMPERATURE = 2.0
+
+# Neutral penalty: the model is biased toward neutral because that's technically
+# correct ~60% of the time on 5-min candles. We penalize neutral logits to force
+# the model to commit to directional predictions when up/down probabilities are
+# non-trivial. This is equivalent to adjusting the decision boundary.
+NEUTRAL_LOGIT_PENALTY = 2.5  # Subtract from neutral logit before softmax
+
 # ---------------------------------------------------------------------------
 # Multi-timeframe TCN configuration
 # ---------------------------------------------------------------------------
@@ -210,7 +219,9 @@ class TCNModel:
 
         with torch.no_grad():
             logits = net(tensor)
-            probs = F.softmax(logits, dim=1).squeeze(0).cpu().numpy()
+            # Penalize neutral (class 2) to break the neutral-always bias
+            logits[:, 2] -= NEUTRAL_LOGIT_PENALTY
+            probs = F.softmax(logits / INFERENCE_TEMPERATURE, dim=1).squeeze(0).cpu().numpy()
 
         predicted_class = int(np.argmax(probs))
         confidence = float(probs[predicted_class])
@@ -241,7 +252,9 @@ class TCNModel:
 
         with torch.no_grad():
             logits = net(tensor)
-            probs = F.softmax(logits, dim=1).cpu().numpy()  # (N, n_classes)
+            # Penalize neutral (class 2) to break the neutral-always bias
+            logits[:, 2] -= NEUTRAL_LOGIT_PENALTY
+            probs = F.softmax(logits / INFERENCE_TEMPERATURE, dim=1).cpu().numpy()  # (N, n_classes)
 
         classes = np.argmax(probs, axis=1)
         results = []

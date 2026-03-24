@@ -1059,6 +1059,15 @@ def train_tcn_rl(
 
     logger.info("TCN RL training complete", variant=variant_name, accuracy=best_acc,
                 dir_accuracy=dir_acc, rl_weighted=reward_weights is not None)
+
+    # Free GPU memory after training — prevents OOM when multiple variants train sequentially
+    # and ensures the prediction service can use GPU for inference between cycles
+    del model, optimizer, scheduler, scaler
+    del X_train, X_test, y_train, y_test, w_train
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+        import gc; gc.collect()
+
     return metadata
 
 
@@ -1159,9 +1168,20 @@ def train_xgboost_rl(
     else:
         dir_acc = 0.0
 
-    # Save
+    # Save latest + versioned copy
     model_path = output_path / "xgboost_latest.json"
     model.save_model(str(model_path))
+
+    # Versioned copy for rollback
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    versioned_path = output_path / f"xgboost_{ts}.json"
+    model.save_model(str(versioned_path))
+
+    # Keep only last 3 versioned copies (XGBoost models are large)
+    import glob as _glob
+    xgb_versions = sorted(_glob.glob(str(output_path / "xgboost_20*.json")))
+    while len(xgb_versions) > 3:
+        os.remove(xgb_versions.pop(0))
 
     metadata = {
         "model_type": "xgboost",
@@ -1524,6 +1544,10 @@ async def training_cycle(pool: asyncpg.Pool, redis: aioredis.Redis,
     for vcfg in TCN_VARIANT_CONFIGS:
         vmeta = await _train_variant(vcfg)
         variant_metas.append(vmeta)
+        # Force GPU memory release between variants to prevent OOM cascade
+        import torch as _torch
+        if _torch.cuda.is_available():
+            _torch.cuda.empty_cache()
         logger.info(f"Variant {vcfg['name']} complete, moving to next")
 
     # Train XGBoost with RL

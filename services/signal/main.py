@@ -35,7 +35,7 @@ from vol_sizing import calculate_vol_targeted_size, SizingResult
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "")
-CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", 0.55))  # v13: raised from 0.50
+CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", 0.10))  # Low: ensemble averaging dilutes confidence; edge gate provides quality filter
 STARTING_CAPITAL = float(os.getenv("STARTING_CAPITAL", 1000.0))
 MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", 0.50))
 MIN_POSITION_USD = float(os.getenv("MIN_POSITION_USD", 1.0))
@@ -282,9 +282,26 @@ async def generate_signal(prediction: dict) -> Optional[Signal]:
         action = "buy"
         signal_side = "long"
     elif normalized_direction == "sell" and has_position and current_side == "long":
-        # v13: ALLOW sell signals for ALL positions — the AI must be able to cut losses
-        # Previous "patience mode" was the #1 cause of oversized losses.
-        # If the model says sell, SELL. Holding losers hoping for recovery is how you blow up.
+        # v14: Sell exits require higher confidence AND minimum hold time to prevent whipsaws.
+        # The position manager's AI pressure system handles gradual exits; direct sell signals
+        # should only fire on strong conviction (high confidence) or after giving the trade time.
+        pos = current_positions[symbol]
+        hold_seconds = (datetime.utcnow() - pos.opened_at).total_seconds() if hasattr(pos, 'opened_at') and pos.opened_at else 999
+        min_hold_for_sell = 180  # 3 minutes minimum hold before allowing sell signal
+        min_sell_confidence = 0.25  # Higher bar for sell exits to prevent whipsaw
+
+        if hold_seconds < min_hold_for_sell and confidence < 0.40:
+            SIGNALS_SKIPPED.labels(reason="sell_too_early").inc()
+            logger.info("Sell signal blocked — position too young",
+                         symbol=symbol, hold_seconds=round(hold_seconds),
+                         confidence=round(confidence, 3), min_hold=min_hold_for_sell)
+            return None
+        if confidence < min_sell_confidence:
+            SIGNALS_SKIPPED.labels(reason="sell_low_confidence").inc()
+            logger.info("Sell signal blocked — low confidence",
+                         symbol=symbol, confidence=round(confidence, 3),
+                         required=min_sell_confidence)
+            return None
         action = "sell"
         signal_side = "long"
     elif normalized_direction == "sell" and not has_position:
@@ -292,7 +309,15 @@ async def generate_signal(prediction: dict) -> Optional[Signal]:
         action = "short_entry"
         signal_side = "short"
     elif normalized_direction == "buy" and has_position and current_side == "short":
-        # SHORT EXIT: bullish prediction while holding a short
+        # SHORT EXIT: same whipsaw protection as long exit
+        pos = current_positions[symbol]
+        hold_seconds = (datetime.utcnow() - pos.opened_at).total_seconds() if hasattr(pos, 'opened_at') and pos.opened_at else 999
+        if hold_seconds < 180 and confidence < 0.40:
+            SIGNALS_SKIPPED.labels(reason="short_exit_too_early").inc()
+            return None
+        if confidence < 0.25:
+            SIGNALS_SKIPPED.labels(reason="short_exit_low_confidence").inc()
+            return None
         action = "short_exit"
         signal_side = "short"
     else:
@@ -383,8 +408,10 @@ async def generate_signal(prediction: dict) -> Optional[Signal]:
     agreement_bonus = float(breakdown.get("agreement_bonus", 0))
     models_agree = agreement_bonus > 0
 
-    # In extreme fear or fear, require minimum confidence for long signals (relaxed: no model agreement required)
-    if action == "buy" and fg_zone_signal in ("extreme_fear", "fear") and confidence < 0.55:
+    # In extreme fear, buying is actually the contrarian play.
+    # Temperature-scaled models produce lower confidence values — threshold matches.
+    fg_buy_threshold = 0.10 if fg_zone_signal == "extreme_fear" else 0.10
+    if action == "buy" and fg_zone_signal in ("extreme_fear", "fear") and confidence < fg_buy_threshold:
         SIGNALS_SKIPPED.labels(reason="fg_low_confidence_fear").inc()
         logger.info("F&G filter blocked low-confidence long in fear zone",
                      symbol=symbol, fear_greed=round(fear_greed_index, 1),
@@ -396,29 +423,18 @@ async def generate_signal(prediction: dict) -> Optional[Signal]:
     # In extreme greed, everyone is over-leveraged long → shorts are easier (0.50 confidence)
     # In fear, shorts still need decent confidence (0.58+) since rebounds are common
     if action == "short_entry":
-        if fg_zone_signal == "extreme_fear" and confidence < 0.60:
+        # Shorting in extreme fear is risky (contrarian is bullish) — need higher confidence
+        if fg_zone_signal == "extreme_fear" and confidence < 0.40:
             SIGNALS_SKIPPED.labels(reason="fg_short_extreme_fear").inc()
             logger.info("F&G filter blocked short in extreme fear (contrarian bullish)",
                          symbol=symbol, fear_greed=round(fear_greed_index, 1),
                          confidence=round(confidence, 3))
             return None
-        elif fg_zone_signal == "fear" and confidence < 0.58:
+        elif fg_zone_signal == "fear" and confidence < 0.35:
             SIGNALS_SKIPPED.labels(reason="fg_short_fear").inc()
             logger.info("F&G filter blocked low-confidence short in fear zone",
                          symbol=symbol, fear_greed=round(fear_greed_index, 1),
                          confidence=round(confidence, 3))
-            return None
-        elif fg_zone_signal == "extreme_greed" and confidence < 0.50:
-            SIGNALS_SKIPPED.labels(reason="fg_short_low_conf").inc()
-            logger.info("F&G filter blocked very low confidence short in extreme greed",
-                         symbol=symbol, fear_greed=round(fear_greed_index, 1),
-                         confidence=round(confidence, 3))
-            return None
-        elif fg_zone_signal in ("neutral", "greed") and confidence < 0.55:
-            SIGNALS_SKIPPED.labels(reason="fg_short_neutral_low_conf").inc()
-            logger.info("F&G filter blocked low-confidence short",
-                         symbol=symbol, fear_greed=round(fear_greed_index, 1),
-                         confidence=round(confidence, 3), zone=fg_zone_signal)
             return None
 
     # ══════════════════════════════════════════════════════════════════
