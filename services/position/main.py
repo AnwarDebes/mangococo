@@ -528,26 +528,28 @@ async def update_prices():
                         if recent_momentum > pos.momentum_peak:
                             pos.momentum_peak = recent_momentum
 
-                        # ── v13: CRASH PROTECTION ──
-                        # If a coin drops >2% from entry, it's likely a rug/dump — exit immediately
-                        if pnl_pct < -0.02 and hold_time_minutes < 30:
-                            logger.info("CRASH PROTECTION EXIT — fast drop >2%",
+                        # ── CRASH PROTECTION ──
+                        # Only exit on genuine crashes/rugs (>5% drop), not normal volatility.
+                        # Research: 2% is normal crypto noise — tight crash protection was the #1 loss cause.
+                        if pnl_pct < -0.05 and hold_time_minutes < 60:
+                            logger.info("CRASH PROTECTION EXIT — severe drop >5%",
                                         symbol=symbol, pnl_pct=f"{pnl_pct:.2%}",
                                         hold_min=f"{hold_time_minutes:.0f}")
                             smart_stop_triggered.append((symbol, f"crash_protection_{pnl_pct:.1%}"))
                             await redis_client.hset("positions", symbol, pos.model_dump_json())
                             continue
 
-                        # ── v13: HARD STOP-LOSS ──
+                        # ── HARD STOP-LOSS ──
                         # Track deepest loss
                         if pnl_pct < pos.lowest_pnl_pct:
                             pos.lowest_pnl_pct = pnl_pct
 
-                        # Exit at -0.75% to target 1:2 risk-reward ratio.
-                        # With ~0.15% slippage, actual loss will be ~0.9%.
-                        # Average win of 0.5% needs losses capped below 1%.
-                        if pnl_pct < -0.0075:
-                            logger.info("HARD STOP-LOSS EXIT — position down >0.75%",
+                        # Exit at -3% — the disaster backstop. Research from 567K backtests:
+                        # tight stops (0.75%) destroy edge by exiting on noise. Crypto routinely
+                        # swings 1-2% intraday. Let the AI exit pressure system handle normal exits;
+                        # this is only for capital preservation on genuine adverse moves.
+                        if pnl_pct < -0.03:
+                            logger.info("HARD STOP-LOSS EXIT — position down >3%",
                                         symbol=symbol,
                                         pnl_pct=f"{pnl_pct:.2%}",
                                         hold_min=f"{hold_time_minutes:.0f}",
@@ -556,11 +558,12 @@ async def update_prices():
                             await redis_client.hset("positions", symbol, pos.model_dump_json())
                             continue
 
-                        # ── v13: STALE POSITION EXIT ──
-                        # Dead capital: if held >20 min and PnL near zero, exit to redeploy
-                        # Old 45-min timeout let capital rot for too long
-                        if hold_time_minutes > 20 and -0.004 < pnl_pct < 0.003:
-                            logger.info("STALE POSITION EXIT — near-zero PnL after 20m",
+                        # ── STALE POSITION EXIT ──
+                        # Dead capital: if held >90 min and PnL near zero, exit to redeploy.
+                        # 20min was too aggressive — many winning trades need 30-60min to develop.
+                        # AI exit pressure handles the "this trade isn't working" case faster.
+                        if hold_time_minutes > 90 and -0.005 < pnl_pct < 0.003:
+                            logger.info("STALE POSITION EXIT — near-zero PnL after 90m",
                                         symbol=symbol, pnl_pct=f"{pnl_pct:.2%}",
                                         hold_min=f"{hold_time_minutes:.0f}",
                                         profit_usd=f"{pos.unrealized_pnl:.2f}")
@@ -568,22 +571,22 @@ async def update_prices():
                             await redis_client.hset("positions", symbol, pos.model_dump_json())
                             continue
 
-                        # ── v13: MOMENTUM TAKE-PROFIT (profitable positions) ──
-                        # Raised minimum from 0.2% to 0.4% so winners have room to run.
-                        # With 0.75% stop, 0.4% minimum TP starts approaching 1:2 RR.
-                        if pnl_pct >= 0.004:  # At least 0.4% profit
+                        # ── MOMENTUM TAKE-PROFIT (profitable positions) ──
+                        # With 3% hard stop, we need winners to run bigger to maintain R:R.
+                        # Minimum 1.5% profit before considering momentum exit.
+                        if pnl_pct >= 0.015:  # At least 1.5% profit
                             # Momentum deceleration — only exit if momentum truly died
                             momentum_decelerating = (
                                 pos.momentum_peak > 0.001 and   # Had strong momentum (0.1%+ in 3s)
                                 recent_momentum <= 0 and        # Momentum is now NEGATIVE
-                                pnl_pct >= 0.004                # At least 0.4% profit
+                                pnl_pct >= 0.015                # At least 1.5% profit
                             )
 
                             # Profit giveback: only if gave back substantial profit
                             profit_giveback = pos.peak_pnl_pct - pnl_pct
                             fast_giveback = (
-                                pos.peak_pnl_pct >= 0.015 and   # Had 1.5%+ peak profit (was 1%)
-                                profit_giveback >= pos.peak_pnl_pct * 0.35  # Gave back 35% (was 40%)
+                                pos.peak_pnl_pct >= 0.03 and    # Had 3%+ peak profit before considering giveback
+                                profit_giveback >= pos.peak_pnl_pct * 0.40  # Gave back 40% of peak
                                 and recent_momentum <= 0
                             )
 
@@ -821,12 +824,10 @@ async def listen_for_prediction_exits():
                             regime=regime_name, vol_urgency=f"{p_vol_urgency:.3f}",
                             should_exit=should_exit)
 
-            # v12: AI exits blocked only for moderate losses (-0.2% to -1%)
-            # Tiny losses (<0.2%): let AI exit — not worth holding
-            # Moderate losses: patience mode, wait for recovery
-            # Deep losses (>1%): hard stop-loss handles these
-            if should_exit and -0.01 < pnl_pct < -0.002:
-                logger.info("AI exit BLOCKED — patience mode for moderate loss",
+            # AI exits: let the AI make the call. Only block exits for tiny losses
+            # where the fee to exit costs more than just holding.
+            if should_exit and -0.002 < pnl_pct < 0:
+                logger.info("AI exit BLOCKED — loss smaller than exit fees",
                             symbol=symbol, pnl_pct=f"{pnl_pct:.4%}", pressure=f"{pressure:.3f}")
                 exit_tracker.reset(symbol)
                 should_exit = False

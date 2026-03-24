@@ -1901,4 +1901,15 @@ async def main():
 
 
 if __name__ == "__main__":
+    # PID lock to prevent multiple instances (was spawning 20+ processes)
+    import fcntl
+    LOCK_FILE = MODELS_DIR / ".cl_singleton.lock"
+    lock_fd = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("ERROR: Another continuous-learner is already running. Exiting.")
+        sys.exit(1)
+    lock_fd.write(str(os.getpid()))
+    lock_fd.flush()
     asyncio.run(main())
