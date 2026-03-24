@@ -55,13 +55,15 @@ class SizingResult:
 # ── Base Configuration ───────────────────────────────────────────────
 
 # Risk targeting
-BASE_RISK_PCT = 0.015            # Base: 1.5% of portfolio risk per trade
-N_ATR_RISK = 2.0                 # risk = N * ATR (2 ATR = expected move)
+# v13: Reduced from 1.5% to 1.0% — smaller positions means each loss hurts less.
+# With 410 trades/day, even 1% risk per trade is aggressive.
+BASE_RISK_PCT = 0.020            # v14: 2.0% risk per trade — user wants bigger positions
+N_ATR_RISK = 1.5                 # risk = N * ATR (1.5 ATR = tighter risk targeting)
 
 # Dynamic position cap range (replaces fixed 8%)
-MIN_POSITION_CAP_PCT = 0.03     # Floor: never go below 3% max cap
-MAX_POSITION_CAP_PCT = 0.15     # Ceiling: never go above 15% max cap
-BASE_POSITION_CAP_PCT = 0.10    # Starting point: 10% when neutral conditions
+MIN_POSITION_CAP_PCT = 0.08     # v14: Floor raised from 3% to 8%
+MAX_POSITION_CAP_PCT = 0.25     # v14: Ceiling raised from 15% to 25%
+BASE_POSITION_CAP_PCT = 0.15    # v14: Starting point raised from 10% to 15%
 
 # CPPI cushion parameters
 CPPI_FLOOR_PCT = 0.80           # Protect 80% of starting capital (floor)

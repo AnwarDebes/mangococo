@@ -144,16 +144,22 @@ def load_models() -> None:
 
     # TCN (primary — kept for backwards compatibility)
     tcn_info = registry.get_latest("tcn")
-    if tcn_info and os.path.isfile(tcn_info.path):
+    tcn_path = tcn_info.path if tcn_info and os.path.isfile(tcn_info.path) else None
+    if not tcn_path:
+        direct_path = MODEL_DIR / "tcn_latest.pt"
+        if os.path.isfile(direct_path):
+            tcn_path = str(direct_path)
+            logger.info("TCN found via direct file (no registry entry)")
+    if tcn_path:
         try:
             tcn_model = TCNModel()
-            tcn_model.load(tcn_info.path)
-            logger.info("TCN model loaded from registry", version=tcn_info.version)
+            tcn_model.load(tcn_path)
+            logger.info("TCN model loaded", path=tcn_path)
         except Exception as exc:
             logger.warning("Failed to load TCN model", error=str(exc))
             tcn_model = None
     else:
-        logger.info("No TCN model in registry, ML-TCN will be unavailable")
+        logger.info("No TCN model found, ML-TCN will be unavailable")
 
     # Multi-timeframe TCN ensemble (loads variant-specific or falls back to primary)
     multi_tcn = MultiTCNEnsemble()
@@ -164,18 +170,25 @@ def load_models() -> None:
     else:
         logger.info("Multi-TCN ensemble has no loaded models, will use single TCN fallback")
 
-    # XGBoost
+    # XGBoost — try registry first, fall back to direct file
     xgb_info = registry.get_latest("xgboost")
-    if xgb_info and os.path.isfile(xgb_info.path):
+    xgb_path = xgb_info.path if xgb_info and os.path.isfile(xgb_info.path) else None
+    if not xgb_path:
+        # Direct file fallback when registry doesn't exist yet
+        direct_path = MODEL_DIR / "xgboost_latest.json"
+        if os.path.isfile(direct_path):
+            xgb_path = str(direct_path)
+            logger.info("XGBoost found via direct file (no registry entry)")
+    if xgb_path:
         try:
             xgb_model = XGBoostModel()
-            xgb_model.load(xgb_info.path)
-            logger.info("XGBoost model loaded from registry", version=xgb_info.version)
+            xgb_model.load(xgb_path)
+            logger.info("XGBoost model loaded", path=xgb_path)
         except Exception as exc:
             logger.warning("Failed to load XGBoost model", error=str(exc))
             xgb_model = None
     else:
-        logger.info("No XGBoost model in registry, ML-XGB will be unavailable")
+        logger.info("No XGBoost model found, ML-XGB will be unavailable")
 
 
 # ---------------------------------------------------------------------------
@@ -785,6 +798,7 @@ async def prediction_loop():
                         xgb_direction=xgb_pred.direction if xgb_pred else None,
                         xgb_confidence=round(_safe_float(xgb_pred.confidence, 0.5), 4) if xgb_pred else None,
                     )
+
 
             else:
                 # Legacy fallback for all symbols

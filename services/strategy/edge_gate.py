@@ -41,8 +41,8 @@ class EdgeDecision:
 
 # ── Configuration ─────────────────────────────────────────────────────
 
-EDGE_THRESHOLD = 0.50          # minimum edge score to take trade (raised from 0.40)
-MIN_CONFIDENCE = 0.50          # model must be at least 50% confident (raised from 0.35)
+EDGE_THRESHOLD = 0.58          # v13: raised from 0.50 — only take trades with real edge
+MIN_CONFIDENCE = 0.55          # v13: raised from 0.50 — marginal signals were net-negative
 AGREEMENT_BONUS = 0.15         # bonus when TCN + XGBoost agree
 
 # Spread filter: tightened for normal entries, relaxed for fast movers
@@ -100,13 +100,14 @@ FEAR_GREED_MIN_CONFIDENCE = {
     "extreme_greed": 0.55,   # Relaxed from 0.70 to allow more entries in extreme greed
 }
 
-# F&G-aware max concurrent position limits
+# v13: Reduced max concurrent positions — too many correlated altcoin positions
+# destroys diversification benefit. Fewer, higher-conviction trades is better.
 FEAR_GREED_MAX_POSITIONS = {
-    "extreme_fear":  10,
-    "fear":          10,
-    "neutral":       12,
-    "greed":         8,
-    "extreme_greed": 6,
+    "extreme_fear":  6,
+    "fear":          5,
+    "neutral":       5,
+    "greed":         4,
+    "extreme_greed": 3,
 }
 
 # Direction preference by F&G zone: positive = prefer longs, negative = prefer shorts

@@ -35,12 +35,24 @@ from vol_sizing import calculate_vol_targeted_size, SizingResult
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "")
-CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", 0.50))
+CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", 0.55))  # v13: raised from 0.50
 STARTING_CAPITAL = float(os.getenv("STARTING_CAPITAL", 1000.0))
 MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", 0.50))
 MIN_POSITION_USD = float(os.getenv("MIN_POSITION_USD", 1.0))
+# v13: Daily drawdown circuit breaker — stop trading when losses exceed this % of capital
+DAILY_DRAWDOWN_KILL_PCT = float(os.getenv("DAILY_DRAWDOWN_KILL_PCT", 0.03))  # 3%
+circuit_breaker_active = False
+circuit_breaker_until: Optional[datetime] = None
 TRADING_PAIRS_FILE = os.getenv("TRADING_PAIRS_FILE", "")
 TRADING_PAIRS = os.getenv("TRADING_PAIRS", "BTC/USDT,ETH/USDT,SOL/USDT").split(",")
+
+# v13: Symbol blacklist — persistently losing symbols that drain capital.
+# These 9 symbols accounted for -$26 in losses (nearly 2x the system's total profit).
+# Reviewed from forensic analysis of 410 trades on 2026-03-24.
+SYMBOL_BLACKLIST = {
+    "AFRD/USDT", "AIA/USDT", "AIXPLAY/USDT", "ART/USDT", "ATT/USDT",
+    "BANANAS31/USDT", "BATTERY/USDT", "BAY/USDT", "BEAT/USDT",
+}
 
 logger = structlog.get_logger()
 
@@ -164,8 +176,52 @@ async def _get_open_risk() -> float:
     return total_risk
 
 
+async def _check_circuit_breaker() -> bool:
+    """v13: Check if daily drawdown circuit breaker should be active.
+    Returns True if trading should be halted."""
+    global circuit_breaker_active, circuit_breaker_until
+
+    # If circuit breaker was tripped, check if we should reset (new UTC day)
+    if circuit_breaker_active and circuit_breaker_until:
+        if datetime.utcnow() >= circuit_breaker_until:
+            circuit_breaker_active = False
+            circuit_breaker_until = None
+            logger.info("CIRCUIT BREAKER RESET — new trading day")
+            return False
+        return True
+
+    # Check daily P&L from trade history
+    try:
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        recent_trades = await redis_client.lrange("trade_history", 0, 199)
+        daily_pnl = 0.0
+        for t in recent_trades:
+            trade = json.loads(t)
+            exit_time = trade.get("exit_time", "")
+            if exit_time.startswith(today):
+                daily_pnl += float(trade.get("realized_pnl", 0))
+
+        portfolio_value = await _get_portfolio_value()
+        if portfolio_value > 0:
+            daily_loss_pct = abs(daily_pnl) / portfolio_value if daily_pnl < 0 else 0
+            if daily_loss_pct >= DAILY_DRAWDOWN_KILL_PCT:
+                circuit_breaker_active = True
+                # Reset at midnight UTC
+                tomorrow = datetime.utcnow().replace(hour=0, minute=0, second=0) + timedelta(days=1)
+                circuit_breaker_until = tomorrow
+                logger.warning("CIRCUIT BREAKER TRIPPED — daily loss %.2f%% exceeds %.1f%% limit. "
+                               "All new entries blocked until %s",
+                               daily_loss_pct * 100, DAILY_DRAWDOWN_KILL_PCT * 100,
+                               tomorrow.isoformat())
+                return True
+    except Exception as e:
+        logger.error("Circuit breaker check failed", error=str(e))
+
+    return False
+
+
 async def generate_signal(prediction: dict) -> Optional[Signal]:
-    """Generate a signal with full 3-layer strategy gating."""
+    """Generate a signal with full 3-layer strategy gating + v13 circuit breaker."""
     symbol = prediction.get("symbol")
     direction = prediction.get("direction", "hold")
     confidence = _safe_float(prediction.get("confidence"), 0.0)
@@ -186,6 +242,11 @@ async def generate_signal(prediction: dict) -> Optional[Signal]:
 
     if not symbol or current_price <= 0:
         SIGNALS_SKIPPED.labels(reason="missing_price").inc()
+        return None
+
+    # v13: Blacklist check — skip consistently losing symbols
+    if symbol in SYMBOL_BLACKLIST:
+        SIGNALS_SKIPPED.labels(reason="blacklisted_symbol").inc()
         return None
 
     # Idempotency
@@ -221,15 +282,9 @@ async def generate_signal(prediction: dict) -> Optional[Signal]:
         action = "buy"
         signal_side = "long"
     elif normalized_direction == "sell" and has_position and current_side == "long":
-        # v10: Block sell signals for losing positions — patience mode, wait for recovery
-        pos = current_positions[symbol]
-        if pos.entry_price > 0 and pos.current_price > 0:
-            pos_pnl_pct = (pos.current_price - pos.entry_price) / pos.entry_price
-            if pos_pnl_pct < 0:
-                logger.info("Sell signal BLOCKED — position in loss, patience mode",
-                            symbol=symbol, pnl_pct=f"{pos_pnl_pct:.4%}")
-                SIGNALS_SKIPPED.labels(reason="patience_block_loss").inc()
-                return None
+        # v13: ALLOW sell signals for ALL positions — the AI must be able to cut losses
+        # Previous "patience mode" was the #1 cause of oversized losses.
+        # If the model says sell, SELL. Holding losers hoping for recovery is how you blow up.
         action = "sell"
         signal_side = "long"
     elif normalized_direction == "sell" and not has_position:
@@ -243,6 +298,13 @@ async def generate_signal(prediction: dict) -> Optional[Signal]:
     else:
         SIGNALS_SKIPPED.labels(reason="no_action").inc()
         return None
+
+    # v13: Circuit breaker — block ALL new entries when daily drawdown exceeds limit
+    # Exit signals still pass through (must be able to close positions)
+    if action in ("buy", "short_entry"):
+        if await _check_circuit_breaker():
+            SIGNALS_SKIPPED.labels(reason="circuit_breaker").inc()
+            return None
 
     # Per-symbol loss cooldown: block re-entry after a losing trade
     if action in ("buy", "short_entry") and symbol in symbol_loss_cooldowns:

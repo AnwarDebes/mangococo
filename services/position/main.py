@@ -528,24 +528,26 @@ async def update_prices():
                         if recent_momentum > pos.momentum_peak:
                             pos.momentum_peak = recent_momentum
 
-                        # ── v11: CRASH PROTECTION ──
-                        # If a coin drops >3% from entry, it's likely a rug/dump — exit immediately
-                        if pnl_pct < -0.03 and hold_time_minutes < 30:
-                            logger.info("CRASH PROTECTION EXIT — fast drop >3%",
+                        # ── v13: CRASH PROTECTION ──
+                        # If a coin drops >2% from entry, it's likely a rug/dump — exit immediately
+                        if pnl_pct < -0.02 and hold_time_minutes < 30:
+                            logger.info("CRASH PROTECTION EXIT — fast drop >2%",
                                         symbol=symbol, pnl_pct=f"{pnl_pct:.2%}",
                                         hold_min=f"{hold_time_minutes:.0f}")
                             smart_stop_triggered.append((symbol, f"crash_protection_{pnl_pct:.1%}"))
                             await redis_client.hset("positions", symbol, pos.model_dump_json())
                             continue
 
-                        # ── v12: HARD STOP-LOSS (replaces recovery bounce) ──
+                        # ── v13: HARD STOP-LOSS ──
                         # Track deepest loss
                         if pnl_pct < pos.lowest_pnl_pct:
                             pos.lowest_pnl_pct = pnl_pct
 
-                        # Exit immediately at -1% — recovery bounce was losing $13+ across 12 trades
-                        if pnl_pct < -0.01:
-                            logger.info("HARD STOP-LOSS EXIT — position down >1%",
+                        # Exit at -0.75% to target 1:2 risk-reward ratio.
+                        # With ~0.15% slippage, actual loss will be ~0.9%.
+                        # Average win of 0.5% needs losses capped below 1%.
+                        if pnl_pct < -0.0075:
+                            logger.info("HARD STOP-LOSS EXIT — position down >0.75%",
                                         symbol=symbol,
                                         pnl_pct=f"{pnl_pct:.2%}",
                                         hold_min=f"{hold_time_minutes:.0f}",
@@ -554,10 +556,11 @@ async def update_prices():
                             await redis_client.hset("positions", symbol, pos.model_dump_json())
                             continue
 
-                        # ── v12: STALE POSITION EXIT ──
-                        # If held >45 min and PnL near zero, exit to free capital
-                        if hold_time_minutes > 45 and -0.005 < pnl_pct < 0.002:
-                            logger.info("STALE POSITION EXIT — near-zero PnL after 45m",
+                        # ── v13: STALE POSITION EXIT ──
+                        # Dead capital: if held >20 min and PnL near zero, exit to redeploy
+                        # Old 45-min timeout let capital rot for too long
+                        if hold_time_minutes > 20 and -0.004 < pnl_pct < 0.003:
+                            logger.info("STALE POSITION EXIT — near-zero PnL after 20m",
                                         symbol=symbol, pnl_pct=f"{pnl_pct:.2%}",
                                         hold_min=f"{hold_time_minutes:.0f}",
                                         profit_usd=f"{pos.unrealized_pnl:.2f}")
@@ -565,20 +568,22 @@ async def update_prices():
                             await redis_client.hset("positions", symbol, pos.model_dump_json())
                             continue
 
-                        # ── MOMENTUM TAKE-PROFIT (profitable positions) ──
-                        if pnl_pct >= 0.002:  # At least 0.2% profit (v10: lowered from 0.3% to capture more exits in chop)
-                            # v8: Momentum deceleration — only exit if momentum truly died
+                        # ── v13: MOMENTUM TAKE-PROFIT (profitable positions) ──
+                        # Raised minimum from 0.2% to 0.4% so winners have room to run.
+                        # With 0.75% stop, 0.4% minimum TP starts approaching 1:2 RR.
+                        if pnl_pct >= 0.004:  # At least 0.4% profit
+                            # Momentum deceleration — only exit if momentum truly died
                             momentum_decelerating = (
                                 pos.momentum_peak > 0.001 and   # Had strong momentum (0.1%+ in 3s)
                                 recent_momentum <= 0 and        # Momentum is now NEGATIVE
-                                pnl_pct >= 0.002                # At least 0.2% profit
+                                pnl_pct >= 0.004                # At least 0.4% profit
                             )
 
                             # Profit giveback: only if gave back substantial profit
                             profit_giveback = pos.peak_pnl_pct - pnl_pct
                             fast_giveback = (
-                                pos.peak_pnl_pct >= 0.01 and    # Had 1%+ peak profit
-                                profit_giveback >= pos.peak_pnl_pct * 0.40  # Gave back 40%
+                                pos.peak_pnl_pct >= 0.015 and   # Had 1.5%+ peak profit (was 1%)
+                                profit_giveback >= pos.peak_pnl_pct * 0.35  # Gave back 35% (was 40%)
                                 and recent_momentum <= 0
                             )
 

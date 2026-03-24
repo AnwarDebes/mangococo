@@ -310,31 +310,38 @@ def compute_features_for_df(df: pd.DataFrame) -> np.ndarray:
 
 
 def compute_targets_5class(close: np.ndarray, horizon: int = REWARD_LOOKBACK_CANDLES) -> np.ndarray:
-    """5-class targets for XGBoost matching prediction service labels."""
+    """5-class targets for XGBoost matching prediction service labels.
+
+    Thresholds lowered from 0.003/0.015 to 0.0005/0.002 to avoid class imbalance.
+    Old thresholds gave 95% hold class → model always predicts hold.
+    New thresholds give ~47% hold, ~22% buy/sell, ~5% strong_buy/sell.
+    """
     future_close = np.roll(close, -horizon)
     future_ret = np.divide(future_close - close, np.maximum(close, 1e-10))
     future_ret[-horizon:] = 0  # no future data for last `horizon` candles
 
     targets = np.full(len(close), 2)  # default: hold
-    targets[future_ret > 0.015] = 4   # strong_buy
-    targets[future_ret > 0.003] = 3   # buy (where not already strong_buy)
-    targets[future_ret < -0.015] = 0  # strong_sell
-    targets[future_ret < -0.003] = 1  # sell (where not already strong_sell)
-    # Fix precedence
-    targets[(future_ret > 0.015)] = 4
-    targets[(future_ret < -0.015)] = 0
+    targets[future_ret > 0.0005] = 3   # buy
+    targets[future_ret > 0.002] = 4    # strong_buy
+    targets[future_ret < -0.0005] = 1  # sell
+    targets[future_ret < -0.002] = 0   # strong_sell
     return targets
 
 
 def compute_targets_3class(close: np.ndarray, horizon: int = REWARD_LOOKBACK_CANDLES) -> np.ndarray:
-    """3-class targets for TCN: 0=up, 1=down, 2=neutral."""
+    """3-class targets for TCN: 0=up, 1=down, 2=neutral.
+
+    Threshold lowered from 0.001 to 0.0003 to avoid class imbalance
+    (0.001 gave ~72% neutral, causing model to collapse to always-neutral).
+    0.0003 gives ~34/35/31 distribution across up/down/neutral.
+    """
     future_close = np.roll(close, -horizon)
     future_ret = np.divide(future_close - close, np.maximum(close, 1e-10))
     future_ret[-horizon:] = 0  # no future data for last `horizon` candles
 
     targets = np.full(len(close), 2)  # neutral
-    targets[future_ret > 0.001] = 0   # up
-    targets[future_ret < -0.001] = 1  # down
+    targets[future_ret > 0.0003] = 0   # up
+    targets[future_ret < -0.0003] = 1  # down
     return targets
 
 
@@ -734,8 +741,14 @@ def micro_train_tcn(trade_buffer: TradeFeatureBuffer, model_path: str) -> Option
     y = torch.tensor(np.array(y_seqs, dtype=np.int64)).to(device)
     w = torch.tensor(np.array(w_seqs, dtype=np.float32)).to(device)
 
+    # Inverse-frequency class weights for micro-training
+    micro_counts = torch.bincount(y, minlength=3).float().clamp(min=1.0)
+    micro_cw = (1.0 / micro_counts)
+    micro_cw = micro_cw / micro_cw.sum() * 3.0
+    micro_cw = micro_cw.to(device)
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=MICRO_TRAIN_LR, weight_decay=1e-4)
-    criterion = nn.CrossEntropyLoss(reduction='none')
+    criterion = nn.CrossEntropyLoss(weight=micro_cw, reduction='none')
 
     use_amp = USE_AMP and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
@@ -754,6 +767,9 @@ def micro_train_tcn(trade_buffer: TradeFeatureBuffer, model_path: str) -> Option
         scaler.step(optimizer)
         scaler.update()
         total_loss += weighted_loss.item()
+
+    # Ensure float32 before saving (AMP autocast may leave BatchNorm buffers in float16)
+    model.float()
 
     # Save updated model
     torch.save({
@@ -872,7 +888,17 @@ def train_tcn_rl(
                              num_workers=4, pin_memory=True, persistent_workers=True)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-    criterion = nn.CrossEntropyLoss(reduction='none')
+
+    # Compute inverse-frequency class weights to combat class imbalance
+    # Without this, the model collapses to always predicting the majority class
+    class_counts = torch.bincount(y_train, minlength=3).float().clamp(min=1.0)
+    class_weights = (1.0 / class_counts)
+    class_weights = class_weights / class_weights.sum() * len(class_counts)  # normalize to mean=1
+    class_weights = class_weights.to(device)
+    logger.info("TCN class weights", weights=class_weights.tolist(),
+                counts=class_counts.int().tolist())
+
+    criterion = nn.CrossEntropyLoss(weight=class_weights, reduction='none')
     best_acc = 0.0
 
     # v5: Cosine annealing with higher initial LR for fast adaptation
@@ -955,6 +981,8 @@ def train_tcn_rl(
 
         if acc > best_acc:
             best_acc = acc
+            # Ensure float32 before saving (AMP autocast may leave BatchNorm buffers in float16)
+            model.float()
             save_dict = {
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
@@ -995,13 +1023,16 @@ def train_tcn_rl(
                 torch.save(save_dict, best_path)
 
     # Directional accuracy (ignore neutral class=2)
+    model.float()  # Ensure float32 for final evaluation
     model.eval()
     with torch.no_grad():
+        X_test_dev = X_test.to(device)
+        y_test_dev = y_test.to(device)
         with torch.amp.autocast("cuda", enabled=use_amp):
-            test_logits = model(X_test)
+            test_logits = model(X_test_dev)
         preds = test_logits.argmax(dim=1)
-        dir_mask = y_test != 2
-        dir_acc = (preds[dir_mask] == y_test[dir_mask]).float().mean().item() if dir_mask.sum() > 0 else 0.0
+        dir_mask = y_test_dev != 2
+        dir_acc = (preds[dir_mask] == y_test_dev[dir_mask]).float().mean().item() if dir_mask.sum() > 0 else 0.0
 
     metadata = {
         "model_type": "tcn",
@@ -1086,7 +1117,7 @@ def train_xgboost_rl(
         "max_depth": XGB_MAX_DEPTH,
         "learning_rate": lr,
         "tree_method": "hist",
-        "device": "cuda",
+        "device": "cpu",  # Use CPU — GPU memory reserved by TCN variants
         "subsample": 0.8,
         "colsample_bytree": 0.8,
     }
@@ -1509,11 +1540,15 @@ async def training_cycle(pool: asyncpg.Pool, redis: aioredis.Redis,
     # v6: Performance gating — rolling window + staleness override
     tcn_deployed = True
     xgb_deployed = True
-    MIN_ACCURACY_FLOOR = 0.45  # Better than random for 3-class
+    MIN_ACCURACY_FLOOR_3CLASS = 0.40  # Better than random for 3-class (random=33%)
+    MIN_ACCURACY_FLOOR_5CLASS = 0.25  # Better than random for 5-class (random=20%)
     STALENESS_MINUTES = 30
 
-    def _should_deploy(new_acc, meta_pattern, model_label):
+    def _should_deploy(new_acc, meta_pattern, model_label, min_floor=None):
         """Check if new model should be deployed using rolling window of last 3 models."""
+        if min_floor is None:
+            min_floor = MIN_ACCURACY_FLOOR_3CLASS
+        MIN_ACCURACY_FLOOR = min_floor  # local alias for this call
         import glob as _glob
 
         # Check staleness of current model
@@ -1573,9 +1608,9 @@ async def training_cycle(pool: asyncpg.Pool, redis: aioredis.Redis,
     if GATE_MODELS:
         new_tcn_acc = tcn_meta.get("accuracy", 0)
         new_xgb_acc = xgb_meta.get("accuracy", 0)
-        if not _should_deploy(new_tcn_acc, "tcn_20*.pt", "tcn"):
+        if not _should_deploy(new_tcn_acc, "tcn_20*.pt", "tcn", min_floor=MIN_ACCURACY_FLOOR_3CLASS):
             tcn_deployed = False
-        if not _should_deploy(new_xgb_acc, "xgboost_20*.json", "xgboost"):
+        if not _should_deploy(new_xgb_acc, "xgboost_20*.json", "xgboost", min_floor=MIN_ACCURACY_FLOOR_5CLASS):
             xgb_deployed = False
 
     # Update registry and signal reload only if at least one model improved

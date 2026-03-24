@@ -59,17 +59,19 @@ REGIME_STOP_MULTS = {
 }
 
 # Hard floor: absolute maximum loss regardless of other factors
-# v8: "Always win" — no stop loss, wait for recovery, take profit when ready
-HARD_FLOOR_LOSS_PCT_NORMAL = 0.50    # 50% — effectively disabled (disaster prevention only)
-HARD_FLOOR_LOSS_PCT_HIGH_VOL = 0.30  # 30% — only for absolute catastrophe
+# v13: Realistic hard floors — the "always win" philosophy was the #1 reason for losses.
+# The position manager has a -0.75% hard stop that fires first. These are backup disaster limits.
+HARD_FLOOR_LOSS_PCT_NORMAL = 0.02    # 2% — if position manager's stop somehow misses
+HARD_FLOOR_LOSS_PCT_HIGH_VOL = 0.015 # 1.5% — tighter in high vol (moves faster)
 
 # Minimum stop: dynamic — used only for trailing after profit
-MIN_STOP_FLOOR = 0.003           # 0.3% trailing stop once profitable
-MIN_STOP_ATR_MULT = 0.3          # tight trailing = 0.3x ATR
+# v13: Widened trailing to let winners breathe. 0.3% was getting shaken out by noise.
+MIN_STOP_FLOOR = 0.005           # 0.5% trailing stop once profitable
+MIN_STOP_ATR_MULT = 0.5          # trailing = 0.5x ATR (was 0.3)
 
-# Trailing activation: start trailing early
-TRAIL_ACTIVATION_FLOOR = 0.004   # 0.4% profit activates trailing (was 1.5%)
-TRAIL_ACTIVATION_ATR_MULT = 0.5  # activate trailing after 0.5x ATR profit (was 1.2)
+# Trailing activation: don't start trailing until position has real profit
+TRAIL_ACTIVATION_FLOOR = 0.006   # 0.6% profit activates trailing (was 0.4%)
+TRAIL_ACTIVATION_ATR_MULT = 0.8  # activate trailing after 0.8x ATR profit (was 0.5)
 
 # Time guard: positions held less than this many minutes only use hard floor
 YOUNG_POSITION_MINUTES = 1.0     # 1 min guard (was 2)
@@ -86,10 +88,10 @@ PROFIT_LOCK_TIER2_FLOOR = 0.008          # Minimum locked profit at tier 2 (was 
 PROFIT_LOCK_TIER3_THRESHOLD = 0.03       # 3.0%+ profit → lock 1.5% profit
 PROFIT_LOCK_TIER3_FLOOR = 0.015          # Minimum locked profit at tier 3
 
-# v8: No quick kill — wait for recovery
-# Only exit when profitable or after extended hold with no recovery
-PATIENCE_MAX_MINUTES = 120.0     # After 2 hours of holding at a loss, consider cutting
-PATIENCE_MIN_LOSS_PCT = 0.05     # Only cut if losing > 5% after patience period
+# v13: Cut losses faster, not slower. Patience = death in algo trading.
+# Position manager's hard stop at 0.75% is the real exit. This is backup.
+PATIENCE_MAX_MINUTES = 15.0      # After 15 min at a loss with no recovery, consider cutting
+PATIENCE_MIN_LOSS_PCT = 0.005    # Cut if losing > 0.5% after patience period
 
 # Volatility-adaptive trailing: scale trailing stop width by recent vol
 VOL_TRAIL_WIDEN_THRESHOLD = 1.5  # If vol_ratio > 1.5, widen trailing stop

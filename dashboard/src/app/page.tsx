@@ -91,7 +91,7 @@ export default function DashboardPage() {
       ? (trades.filter((t) => t.realized_pnl > 0).length / trades.length) * 100
       : 0;
 
-  const totalTrades = trades?.length || 0;
+  const totalTrades = tradesData?.total || 0;
 
   const avgReturn =
     trades && trades.length > 0
