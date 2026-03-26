@@ -209,7 +209,7 @@ export default function TradeHistory() {
                       getPnlColor(trade.pnl_pct)
                     )}
                   >
-                    {formatPercent(trade.pnl_pct)}
+                    {formatPercent(trade.pnl_pct,4)}
                   </td>
                   <td className="px-3 py-2.5 text-xs text-gray-400">
                     {trade.exit_reason}
